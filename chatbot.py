@@ -75,9 +75,9 @@ csv_tree     = get_csv_tree(csv_df)
 # ── Interpretation helpers ─────────────────────────────────────
 def soc_interp(v):
     v = float(v)
-    if v < 1:   return f"{v:.2f} g/kg — Low. Needs organic amendments."
-    elif v < 2: return f"{v:.2f} g/kg — Medium. Moderately fertile."
-    else:        return f"{v:.2f} g/kg — High. Good fertility."
+    if v < 0.5:    return f"{v:.2f} g/kg — Low. Needs organic amendments."
+    elif v < 0.75: return f"{v:.2f} g/kg — Moderate. Moderately fertile."
+    else:           return f"{v:.2f} g/kg — High. Good fertility."
 
 def depth_interp(v):
     v = int(v)
@@ -103,7 +103,7 @@ def ph_interp(v):
 def fertility_score(record):
     score = 0
     try:
-        if float(record['SOC']) >= 2: score += 1
+        if float(record['SOC']) >= 0.75: score += 1
     except: pass
     try:
         if int(record['DEPTH']) >= 75: score += 1
