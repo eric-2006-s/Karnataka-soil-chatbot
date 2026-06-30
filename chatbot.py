@@ -28,7 +28,7 @@ groq_client = Groq(api_key=st.secrets["GROQ_API_KEY"])
 BASE = os.path.dirname(os.path.abspath(__file__))
 
 # Replace this with your actual Hugging Face dataset URL (use /resolve/main/, not /blob/main/)
-CSV_URL = "https://huggingface.co/datasets/ricu9656/karnataka-soil-data/resolve/main/Export_Output.csv"
+CSV_URL = "https://huggingface.co/datasets/<your-username>/<dataset-name>/resolve/main/Export_Output.csv"
 CSV_PATH = os.path.join(BASE, "Export_Output.csv")
 
 # ── Data loading ──────────────────────────────────────────────
@@ -124,6 +124,32 @@ def haversine_km(lat1, lon1, lat2, lon2):
     dlam = math.radians(lon2 - lon1)
     a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlam/2)**2
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+# ── Weather (Open-Meteo, free, no API key needed) ──────────────
+@st.cache_data(ttl=1800)  # cache for 30 minutes so we don't hammer the API
+def fetch_weather(lat, lon):
+    try:
+        url = (
+            "https://api.open-meteo.com/v1/forecast"
+            f"?latitude={lat}&longitude={lon}"
+            "&current=temperature_2m,relative_humidity_2m,precipitation"
+            "&daily=precipitation_sum,temperature_2m_max,temperature_2m_min"
+            "&timezone=auto&forecast_days=5"
+        )
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return None
+
+def rainfall_advice(daily_precip_sum):
+    total = sum(daily_precip_sum) if daily_precip_sum else 0
+    if total < 5:
+        return f"{total:.1f} mm expected over 5 days — Dry spell. Irrigation likely needed."
+    elif total < 25:
+        return f"{total:.1f} mm expected over 5 days — Moderate rainfall. Monitor soil moisture."
+    else:
+        return f"{total:.1f} mm expected over 5 days — Heavy rainfall expected. Watch for waterlogging."
 
 # ── Keyword response ───────────────────────────────────────────
 def keyword_response(query, record):
@@ -327,6 +353,43 @@ else:
     c5.metric("Texture",    f"{float(record['TEXTURE']):.2f}")
     c6.metric("pH",         f"{float(record['PH']):.2f}")
     st.map(pd.DataFrame({"lat": [record["latitude"]], "lon": [record["longitude"]]}))
+
+# ══════════════════════════════════════════════════════════════
+# Weather
+# ══════════════════════════════════════════════════════════════
+st.markdown("---")
+st.markdown("#### 🌦️ Weather Forecast")
+
+weather_lat = float(record["latitude"])
+weather_lon = float(record["longitude"])
+weather_data = fetch_weather(weather_lat, weather_lon)
+
+if weather_data:
+    current = weather_data.get("current", {})
+    daily = weather_data.get("daily", {})
+
+    w1, w2, w3 = st.columns(3)
+    w1.metric("Temperature", f"{current.get('temperature_2m', 'N/A')} °C")
+    w2.metric("Humidity", f"{current.get('relative_humidity_2m', 'N/A')}%")
+    w3.metric("Current Rain", f"{current.get('precipitation', 'N/A')} mm")
+
+    precip_sum = daily.get("precipitation_sum", [])
+    if precip_sum:
+        st.info(f"🌧️ {rainfall_advice(precip_sum)}")
+
+    temp_max = daily.get("temperature_2m_max", [])
+    temp_min = daily.get("temperature_2m_min", [])
+    dates = daily.get("time", [])
+    if dates:
+        forecast_df = pd.DataFrame({
+            "Date": dates,
+            "Max Temp (°C)": temp_max,
+            "Min Temp (°C)": temp_min,
+            "Rain (mm)": precip_sum,
+        })
+        st.dataframe(forecast_df, use_container_width=True, hide_index=True)
+else:
+    st.warning("Weather data unavailable right now.")
 
 # ══════════════════════════════════════════════════════════════
 # PDF export
