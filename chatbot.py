@@ -28,7 +28,7 @@ groq_client = Groq(api_key=st.secrets["GROQ_API_KEY"])
 BASE = os.path.dirname(os.path.abspath(__file__))
 
 # Replace this with your actual Hugging Face dataset URL (use /resolve/main/, not /blob/main/)
-CSV_URL = "https://huggingface.co/datasets/<your-username>/<dataset-name>/resolve/main/Export_Output.csv"
+CSV_URL = "https://huggingface.co/datasets/ricu9656/karnataka-soil-data/resolve/main/Export_Output.csv"
 CSV_PATH = os.path.join(BASE, "Export_Output.csv")
 
 # ── Data loading ──────────────────────────────────────────────
