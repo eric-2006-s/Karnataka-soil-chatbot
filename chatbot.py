@@ -9,7 +9,7 @@ import streamlit as st
 import pandas as pd
 from scipy.spatial import cKDTree
 from groq import Groq
-from gtts import gTTS
+import edge_tts
 from deep_translator import GoogleTranslator
 from streamlit_mic_recorder import mic_recorder
 import tempfile
@@ -201,12 +201,15 @@ def generate_pdf_report(record, village_name=None):
     buffer.seek(0)
     return buffer
 
+async def _speak_text_async(text, voice="en-IN-NeerjaNeural"):
+    communicate = edge_tts.Communicate(str(text), voice=voice)
+    path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3").name
+    await communicate.save(path)
+    return path
+
 def speak_text(text):
     try:
-        tts = gTTS(text=str(text))
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as fp:
-            tts.save(fp.name)
-            return fp.name
+        return asyncio.run(_speak_text_async(text))
     except Exception:
         return None
 
