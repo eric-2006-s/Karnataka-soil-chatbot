@@ -2,7 +2,7 @@ streamlit
 pandas
 scipy
 groq
-gtts
+edge-tts
 deep-translator
 streamlit-mic-recorder
 reportlab
