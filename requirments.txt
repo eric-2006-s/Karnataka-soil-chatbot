@@ -1,0 +1,10 @@
+streamlit
+pandas
+scipy
+groq
+gtts
+deep-translator
+streamlit-mic-recorder
+reportlab
+openpyxl
+requests

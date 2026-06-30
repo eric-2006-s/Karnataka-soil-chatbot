@@ -1,0 +1,5 @@
+.streamlit/secrets.toml
+Export_Output.csv
+voice.wav
+__pycache__/
+*.pyc
