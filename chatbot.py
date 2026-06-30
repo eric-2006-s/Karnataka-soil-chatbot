@@ -24,10 +24,7 @@ from reportlab.lib.units import cm
 groq_client = Groq(api_key=st.secrets["GROQ_API_KEY"])
 
 # ── Paths ────────────────────────────────────────────────────
-# Relative path: put combined_village_data.xlsx in the same repo folder as this script
 BASE = os.path.dirname(os.path.abspath(__file__))
-
-# Replace this with your actual Hugging Face dataset URL (use /resolve/main/, not /blob/main/)
 CSV_URL = "https://huggingface.co/datasets/ricu9656/karnataka-soil-data/resolve/main/Export_Output.csv"
 CSV_PATH = os.path.join(BASE, "Export_Output.csv")
 
@@ -40,7 +37,6 @@ def load_village_data():
 
 @st.cache_data
 def load_csv_data():
-    # Download once, cache locally on the server's disk
     if not os.path.exists(CSV_PATH):
         with st.spinner("Downloading soil dataset (first run only)..."):
             r = requests.get(CSV_URL)
@@ -49,12 +45,11 @@ def load_csv_data():
                 f.write(r.content)
 
     df = pd.read_csv(CSV_PATH)
-    # Normalize CSV headers to match Excel column names
     df = df.rename(columns={
         "Depth":     "DEPTH",
         "pH":        "PH",
         "Texture":   "TEXTURE",
-        "Longitude": "longitude",  # capital L -> lowercase
+        "Longitude": "longitude",
     })
     df = df[df['latitude'].notna() & df['longitude'].notna()]
     return df
@@ -72,6 +67,34 @@ csv_df     = load_csv_data()
 village_tree = get_village_tree(village_df)
 csv_tree     = get_csv_tree(csv_df)
 
+# ── IDW estimation ──────────────────────────────────────────────
+def idw_estimate(tree, df, lat, lon, columns, k=4, power=2, max_dist_deg=0.01):
+    """
+    Estimate values at (lat, lon) using inverse-distance weighting
+    over the k nearest points in df (indexed by tree).
+    max_dist_deg: sanity cutoff (~0.01 deg ≈ 1.1km). If even the nearest
+    point is farther than this, there's no real coverage here -> return None.
+    """
+    distances, indices = tree.query([[lat, lon]], k=k)
+    distances = distances[0]
+    indices = indices[0]
+
+    if distances[0] > max_dist_deg:
+        return None
+
+    if distances[0] < 1e-12:
+        return df.iloc[indices[0]][columns].astype(float)
+
+    weights = 1.0 / (distances ** power)
+    weights /= weights.sum()
+
+    result = {}
+    for col in columns:
+        values = df.iloc[indices][col].astype(float).values
+        result[col] = float((values * weights).sum())
+
+    return pd.Series(result)
+
 # ── Interpretation helpers ─────────────────────────────────────
 def soc_interp(v):
     v = float(v)
@@ -80,7 +103,7 @@ def soc_interp(v):
     else:           return f"{v:.2f} g/kg — High. Good fertility."
 
 def depth_interp(v):
-    v = int(v)
+    v = round(float(v))
     if v < 25:   return f"{v} cm — Very shallow. Limited crop options."
     elif v < 50: return f"{v} cm — Shallow. Short-rooted crops only."
     elif v < 75: return f"{v} cm — Moderate. Suitable for most crops."
@@ -106,7 +129,7 @@ def fertility_score(record):
         if float(record['SOC']) >= 0.75: score += 1
     except: pass
     try:
-        if int(record['DEPTH']) >= 75: score += 1
+        if float(record['DEPTH']) >= 75: score += 1
     except: pass
     try:
         if 1.2 <= float(record['TEXTURE']) <= 1.6: score += 1
@@ -126,7 +149,7 @@ def haversine_km(lat1, lon1, lat2, lon2):
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 # ── Weather (Open-Meteo, free, no API key needed) ──────────────
-@st.cache_data(ttl=1800)  # cache for 30 minutes so we don't hammer the API
+@st.cache_data(ttl=1800)
 def fetch_weather(lat, lon):
     try:
         url = (
@@ -152,9 +175,9 @@ def rainfall_advice(daily_precip_sum):
         return f"{total:.1f} mm expected over 5 days — Heavy rainfall expected. Watch for waterlogging."
 
 # ── Keyword response ───────────────────────────────────────────
-def keyword_response(query, record):
+def keyword_response(query, record, location_name="Selected location"):
     q = query.lower()
-    name = record.get('KGISVill_2', 'Selected location')
+    name = location_name
 
     if any(w in q for w in ["soc", "organic carbon", "carbon"]):
         return f"**SOC — {name}:** {soc_interp(record['SOC'])}"
@@ -190,7 +213,7 @@ def generate_pdf_report(record, village_name=None):
 
     story = []
     story.append(Paragraph("Karnataka Soil Report", title_style))
-    label = village_name or str(record.get('KGISVill_2', 'Custom location'))
+    label = village_name or "Custom location"
     story.append(Paragraph(f"Location: {label}", heading_style))
     story.append(Spacer(1, 0.3*cm))
 
@@ -198,7 +221,7 @@ def generate_pdf_report(record, village_name=None):
     soil_data = [
         ["Parameter", "Value", "Interpretation"],
         ["SOC (g/kg)", f"{float(record['SOC']):.2f}", soc_interp(record['SOC'])],
-        ["Depth (cm)", str(int(record['DEPTH'])), depth_interp(record['DEPTH'])],
+        ["Depth (cm)", str(round(float(record['DEPTH']))), depth_interp(record['DEPTH'])],
         ["Texture",    f"{float(record['TEXTURE']):.2f}", texture_interp(record['TEXTURE'])],
         ["pH",         f"{float(record['PH']):.2f}", ph_interp(record['PH'])],
     ]
@@ -273,10 +296,10 @@ st.markdown("<h1>🌱 Karnataka Soil Chatbot</h1>", unsafe_allow_html=True)
 
 search_mode = st.radio("Search by", ["District / Sub-district / Village", "Latitude & Longitude"])
 
-record        = None
-csv_record    = None
-nearest_village = None
+record           = None
+nearest_village  = None
 input_lat = input_lon = None
+location_label   = "Selected location"
 
 # ── Mode 1: Village picker ─────────────────────────────────────
 if search_mode == "District / Sub-district / Village":
@@ -286,49 +309,59 @@ if search_mode == "District / Sub-district / Village":
     vill_df = sub_df[sub_df["SUB_DIST"].astype(str) == selected_subdist]
     selected_village = st.selectbox("Village", sorted(vill_df["KGISVill_2"].dropna().astype(str).unique()))
     record = vill_df[vill_df["KGISVill_2"].astype(str) == selected_village].iloc[0]
+    location_label = str(record["KGISVill_2"])
 
-# ── Mode 2: Lat/Lon — pull from CSV + show nearest village ────
+# ── Mode 2: Lat/Lon — IDW estimate from CSV + show nearest village ────
 else:
     col_a, col_b = st.columns(2)
     input_lat = col_a.number_input("Latitude",  format="%.6f", value=15.0)
     input_lon = col_b.number_input("Longitude", format="%.6f", value=75.0)
 
-    # Nearest point in CSV (actual soil data at that coordinate)
-    _, csv_idx = csv_tree.query([[input_lat, input_lon]], k=1)
-    csv_record = csv_df.iloc[csv_idx[0]]
-
-    # Nearest named village from village dataset
-    _, vill_idx = village_tree.query([[input_lat, input_lon]], k=1)
-    nearest_village = village_df.iloc[vill_idx[0]]
-    dist_km = haversine_km(input_lat, input_lon,
-                           float(nearest_village["latitude"]),
-                           float(nearest_village["longitude"]))
-
-    st.markdown("---")
-    st.success(
-        f"📍 Nearest village: **{nearest_village['KGISVill_2']}** "
-        f"({nearest_village['SUB_DIST']}, {nearest_village['DISTRICT']}) "
-        f"— {dist_km:.1f} km away"
+    csv_record = idw_estimate(
+        csv_tree, csv_df, input_lat, input_lon,
+        columns=["SOC", "DEPTH", "TEXTURE", "PH"],
+        k=4
     )
 
-    # Use CSV record as the primary data source
-    record = csv_record
+    if csv_record is None:
+        st.warning("No soil data available near this location (outside coverage area).")
+    else:
+        _, vill_idx = village_tree.query([[input_lat, input_lon]], k=1)
+        nearest_village = village_df.iloc[vill_idx[0]]
+        dist_km = haversine_km(input_lat, input_lon,
+                               float(nearest_village["latitude"]),
+                               float(nearest_village["longitude"]))
+
+        st.markdown("---")
+        st.success(
+            f"📍 Nearest village: **{nearest_village['KGISVill_2']}** "
+            f"({nearest_village['SUB_DIST']}, {nearest_village['DISTRICT']}) "
+            f"— {dist_km:.1f} km away"
+        )
+
+        record = csv_record
+        location_label = f"{input_lat:.4f}, {input_lon:.4f} (near {nearest_village['KGISVill_2']})"
 
 # ══════════════════════════════════════════════════════════════
 # Metrics display
 # ══════════════════════════════════════════════════════════════
 st.markdown("---")
 
-if search_mode == "Latitude & Longitude" and csv_record is not None:
-    st.markdown("#### 📊 Soil data at entered coordinates (from CSV)")
+if record is None:
+    st.info("Select a valid location to view soil data.")
+    st.stop()
+
+if search_mode == "Latitude & Longitude":
+    st.markdown("#### 📊 IDW-estimated soil data at entered coordinates")
+    st.caption("Estimated from the 4 nearest known sample points, weighted by distance.")
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Lat / Lon", f"{input_lat:.4f}, {input_lon:.4f}")
-    c2.metric("SOC (g/kg)", f"{float(csv_record['SOC']):.2f}" if 'SOC' in csv_record else "N/A")
-    c3.metric("Depth (cm)", int(csv_record['DEPTH']) if 'DEPTH' in csv_record else "N/A")
-    c4.metric("Texture",    f"{float(csv_record['TEXTURE']):.2f}" if 'TEXTURE' in csv_record else "N/A")
-    c5.metric("pH",         f"{float(csv_record['PH']):.2f}" if 'PH' in csv_record else "N/A")
+    c2.metric("SOC (g/kg)", f"{float(record['SOC']):.2f}")
+    c3.metric("Depth (cm)", round(float(record['DEPTH'])))
+    c4.metric("Texture",    f"{float(record['TEXTURE']):.2f}")
+    c5.metric("pH",         f"{float(record['PH']):.2f}")
 
-    st.markdown("#### 🏘️ Nearest village soil data")
+    st.markdown("#### 🏘️ Nearest village soil data (for reference)")
     v1, v2, v3, v4, v5, v6 = st.columns(6)
     v1.metric("Village",    nearest_village["KGISVill_2"])
     v2.metric("District",   nearest_village["DISTRICT"])
@@ -337,7 +370,6 @@ if search_mode == "Latitude & Longitude" and csv_record is not None:
     v5.metric("Texture",    f"{float(nearest_village['TEXTURE']):.2f}")
     v6.metric("pH",         f"{float(nearest_village['PH']):.2f}")
 
-    # Map showing both points
     map_df = pd.DataFrame({
         "lat": [input_lat, float(nearest_village["latitude"])],
         "lon": [input_lon, float(nearest_village["longitude"])],
@@ -360,8 +392,11 @@ else:
 st.markdown("---")
 st.markdown("#### 🌦️ Weather Forecast")
 
-weather_lat = float(record["latitude"])
-weather_lon = float(record["longitude"])
+if search_mode == "Latitude & Longitude":
+    weather_lat, weather_lon = input_lat, input_lon
+else:
+    weather_lat, weather_lon = float(record["latitude"]), float(record["longitude"])
+
 weather_data = fetch_weather(weather_lat, weather_lon)
 
 if weather_data:
@@ -396,16 +431,11 @@ else:
 # ══════════════════════════════════════════════════════════════
 st.markdown("---")
 if st.button("📄 Export PDF Report"):
-    village_label = (
-        f"{nearest_village['KGISVill_2']} (nearest to {input_lat:.4f}, {input_lon:.4f})"
-        if search_mode == "Latitude & Longitude"
-        else str(record["KGISVill_2"])
-    )
-    pdf_buffer = generate_pdf_report(record, village_name=village_label)
+    pdf_buffer = generate_pdf_report(record, village_name=location_label)
     st.download_button(
         label="⬇️ Download Report",
         data=pdf_buffer,
-        file_name=f"soil_report_{village_label.split()[0]}.pdf",
+        file_name=f"soil_report_{location_label.split()[0].replace(',', '')}.pdf",
         mime="application/pdf"
     )
 
@@ -448,16 +478,11 @@ query = voice_query if voice_query else text_query
 
 if query and record is not None:
     st.chat_message("user").write(query)
-    answer = keyword_response(query, record)
+    answer = keyword_response(query, record, location_name=location_label)
 
     if answer is None:
-        village_name = (
-            nearest_village["KGISVill_2"]
-            if search_mode == "Latitude & Longitude"
-            else record.get("KGISVill_2", "selected location")
-        )
         context = f"""Soil expert for Karnataka. Data:
-Location: {village_name}
+Location: {location_label}
 SOC: {record.get('SOC', 'N/A')} g/kg, Depth: {record.get('DEPTH', 'N/A')} cm, Texture: {record.get('TEXTURE', 'N/A')}, pH: {record.get('PH', 'N/A')}
 Question: {query}. Be concise."""
         try:
