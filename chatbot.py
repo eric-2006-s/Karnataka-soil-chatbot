@@ -109,11 +109,40 @@ def depth_interp(v):
     elif v < 75: return f"{v} cm — Moderate. Suitable for most crops."
     else:         return f"{v} cm — Deep. Suitable for all crops."
 
-def texture_interp(v):
+# ── Texture: bulk-density value -> soil type band ───────────────
+TEXTURE_BANDS = [
+    (1.45, "Clay"),
+    (1.48, "Sandy Clay"),
+    (1.49, "Clay Loam"),
+    (1.54, "Loam"),
+    (1.56, "Sandy Clay Loam"),
+    (1.63, "Sandy Loam"),
+    (1.65, "Loamy Sand"),
+    (1.69, "Sand"),
+]
+
+def texture_soil_type(v):
+    """Map raw texture/bulk-density value to a soil-type label."""
     v = float(v)
-    if v < 1.2:   return f"{v:.2f} — Fine/clay-like. Good water retention."
-    elif v < 1.6: return f"{v:.2f} — Loam-like. Ideal for most crops."
-    else:          return f"{v:.2f} — Coarse/sandy. Good drainage, low retention."
+    for upper, label in TEXTURE_BANDS:
+        if v <= upper:
+            return label
+    return "Sand"  # anything above 1.69 falls in the coarsest band
+
+TEXTURE_NOTES = {
+    "Clay":            "Heavy, high water retention, poor drainage.",
+    "Sandy Clay":      "Retains water well, drains slowly.",
+    "Clay Loam":       "Balanced retention, moderate drainage.",
+    "Loam":            "Ideal for most crops.",
+    "Sandy Clay Loam": "Good balance of drainage and retention.",
+    "Sandy Loam":      "Good drainage, decent retention.",
+    "Loamy Sand":      "Fast drainage, low retention.",
+    "Sand":            "Very fast drainage, low water retention.",
+}
+
+def texture_interp(v):
+    soil_type = texture_soil_type(v)
+    return f"{soil_type} — {TEXTURE_NOTES.get(soil_type, '')}"
 
 def ph_interp(v):
     v = float(v)
@@ -183,7 +212,7 @@ def keyword_response(query, record, location_name="Selected location"):
         return f"**SOC — {name}:** {soc_interp(record['SOC'])}"
     if "depth" in q:
         return f"**Depth — {name}:** {depth_interp(record['DEPTH'])}"
-    if "texture" in q:
+    if "texture" in q or "soil type" in q:
         return f"**Texture — {name}:** {texture_interp(record['TEXTURE'])}"
     if any(w in q for w in ["ph", "acidity", "acidic", "alkaline"]):
         return f"**pH — {name}:** {ph_interp(record['PH'])}"
@@ -222,7 +251,7 @@ def generate_pdf_report(record, village_name=None):
         ["Parameter", "Value", "Interpretation"],
         ["SOC (g/kg)", f"{float(record['SOC']):.2f}", soc_interp(record['SOC'])],
         ["Depth (cm)", str(round(float(record['DEPTH']))), depth_interp(record['DEPTH'])],
-        ["Texture",    f"{float(record['TEXTURE']):.2f}", texture_interp(record['TEXTURE'])],
+        ["Texture",    texture_soil_type(record['TEXTURE']), texture_interp(record['TEXTURE'])],
         ["pH",         f"{float(record['PH']):.2f}", ph_interp(record['PH'])],
     ]
     soil_table = Table(soil_data, colWidths=[4*cm, 3*cm, 10*cm])
@@ -358,7 +387,7 @@ if search_mode == "Latitude & Longitude":
     c1.metric("Lat / Lon", f"{input_lat:.4f}, {input_lon:.4f}")
     c2.metric("SOC (g/kg)", f"{float(record['SOC']):.2f}")
     c3.metric("Depth (cm)", round(float(record['DEPTH'])))
-    c4.metric("Texture",    f"{float(record['TEXTURE']):.2f}")
+    c4.metric("Texture",    texture_soil_type(record['TEXTURE']))
     c5.metric("pH",         f"{float(record['PH']):.2f}")
 
     st.markdown("#### 🏘️ Nearest village soil data (for reference)")
@@ -367,7 +396,7 @@ if search_mode == "Latitude & Longitude":
     v2.metric("District",   nearest_village["DISTRICT"])
     v3.metric("SOC (g/kg)", f"{float(nearest_village['SOC']):.2f}")
     v4.metric("Depth (cm)", int(nearest_village["DEPTH"]))
-    v5.metric("Texture",    f"{float(nearest_village['TEXTURE']):.2f}")
+    v5.metric("Texture",    texture_soil_type(nearest_village['TEXTURE']))
     v6.metric("pH",         f"{float(nearest_village['PH']):.2f}")
 
     map_df = pd.DataFrame({
@@ -382,7 +411,7 @@ else:
     c2.metric("District",   record["DISTRICT"])
     c3.metric("SOC (g/kg)", f"{float(record['SOC']):.2f}")
     c4.metric("Depth (cm)", int(record["DEPTH"]))
-    c5.metric("Texture",    f"{float(record['TEXTURE']):.2f}")
+    c5.metric("Texture",    texture_soil_type(record['TEXTURE']))
     c6.metric("pH",         f"{float(record['PH']):.2f}")
     st.map(pd.DataFrame({"lat": [record["latitude"]], "lon": [record["longitude"]]}))
 
@@ -483,7 +512,7 @@ if query and record is not None:
     if answer is None:
         context = f"""Soil expert for Karnataka. Data:
 Location: {location_label}
-SOC: {record.get('SOC', 'N/A')} g/kg, Depth: {record.get('DEPTH', 'N/A')} cm, Texture: {record.get('TEXTURE', 'N/A')}, pH: {record.get('PH', 'N/A')}
+SOC: {record.get('SOC', 'N/A')} g/kg, Depth: {record.get('DEPTH', 'N/A')} cm, Texture: {texture_soil_type(record.get('TEXTURE', 0))}, pH: {record.get('PH', 'N/A')}
 Question: {query}. Be concise."""
         try:
             res = groq_client.chat.completions.create(
