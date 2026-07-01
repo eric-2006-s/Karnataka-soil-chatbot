@@ -98,9 +98,9 @@ def idw_estimate(tree, df, lat, lon, columns, k=4, power=2, max_dist_deg=0.01):
 # ── Interpretation helpers ─────────────────────────────────────
 def soc_interp(v):
     v = float(v)
-    if v < 0.5:    return f"{v:.2f} g/kg — Low. Needs organic amendments."
-    elif v < 0.75: return f"{v:.2f} g/kg — Moderate. Moderately fertile."
-    else:           return f"{v:.2f} g/kg — High. Good fertility."
+    if v < 0.5:    return f"{v:.2f}% — Low. Needs organic amendments."
+    elif v < 0.75: return f"{v:.2f}% — Moderate. Moderately fertile."
+    else:           return f"{v:.2f}% — High. Good fertility."
 
 def depth_interp(v):
     v = round(float(v))
@@ -249,7 +249,7 @@ def generate_pdf_report(record, village_name=None):
     story.append(Paragraph("Soil Parameters", heading_style))
     soil_data = [
         ["Parameter", "Value", "Interpretation"],
-        ["SOC (g/kg)", f"{float(record['SOC']):.2f}", soc_interp(record['SOC'])],
+        ["SOC (%)", f"{float(record['SOC']):.2f}", soc_interp(record['SOC'])],
         ["Depth (cm)", str(round(float(record['DEPTH']))), depth_interp(record['DEPTH'])],
         ["Texture",    texture_soil_type(record['TEXTURE']), texture_interp(record['TEXTURE'])],
         ["pH",         f"{float(record['PH']):.2f}", ph_interp(record['PH'])],
@@ -385,7 +385,7 @@ if search_mode == "Latitude & Longitude":
     st.caption("Estimated from the 4 nearest known sample points, weighted by distance.")
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Lat / Lon", f"{input_lat:.4f}, {input_lon:.4f}")
-    c2.metric("SOC (g/kg)", f"{float(record['SOC']):.2f}")
+    c2.metric("SOC (%)", f"{float(record['SOC']):.2f}")
     c3.metric("Depth (cm)", round(float(record['DEPTH'])))
     c4.metric("Texture",    texture_soil_type(record['TEXTURE']))
     c5.metric("pH",         f"{float(record['PH']):.2f}")
@@ -394,7 +394,7 @@ if search_mode == "Latitude & Longitude":
     v1, v2, v3, v4, v5, v6 = st.columns(6)
     v1.metric("Village",    nearest_village["KGISVill_2"])
     v2.metric("District",   nearest_village["DISTRICT"])
-    v3.metric("SOC (g/kg)", f"{float(nearest_village['SOC']):.2f}")
+    v3.metric("SOC (%)", f"{float(nearest_village['SOC']):.2f}")
     v4.metric("Depth (cm)", int(nearest_village["DEPTH"]))
     v5.metric("Texture",    texture_soil_type(nearest_village['TEXTURE']))
     v6.metric("pH",         f"{float(nearest_village['PH']):.2f}")
@@ -409,7 +409,7 @@ else:
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Village",    record["KGISVill_2"])
     c2.metric("District",   record["DISTRICT"])
-    c3.metric("SOC (g/kg)", f"{float(record['SOC']):.2f}")
+    c3.metric("SOC (%)", f"{float(record['SOC']):.2f}")
     c4.metric("Depth (cm)", int(record["DEPTH"]))
     c5.metric("Texture",    texture_soil_type(record['TEXTURE']))
     c6.metric("pH",         f"{float(record['PH']):.2f}")
@@ -512,7 +512,7 @@ if query and record is not None:
     if answer is None:
         context = f"""Soil expert for Karnataka. Data:
 Location: {location_label}
-SOC: {record.get('SOC', 'N/A')} g/kg, Depth: {record.get('DEPTH', 'N/A')} cm, Texture: {texture_soil_type(record.get('TEXTURE', 0))}, pH: {record.get('PH', 'N/A')}
+SOC: {record.get('SOC', 'N/A')}%, Depth: {record.get('DEPTH', 'N/A')} cm, Texture: {texture_soil_type(record.get('TEXTURE', 0))}, pH: {record.get('PH', 'N/A')}
 Question: {query}. Be concise."""
         try:
             res = groq_client.chat.completions.create(
