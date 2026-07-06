@@ -1,5 +1,6 @@
 streamlit
 pandas
+geopandas
 scipy
 groq
 edge-tts
@@ -8,3 +9,5 @@ streamlit-mic-recorder
 reportlab
 openpyxl
 requests
+folium
+streamlit-folium
