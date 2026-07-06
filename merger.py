@@ -1,34 +1,118 @@
+import geopandas as gpd
 import pandas as pd
-import os
-from openpyxl.styles import Font, PatternFill, Alignment
+import json
 
-CSV_FILE = r"C:\Users\erics\OneDrive\Desktop\Export_Output.csv"
-EXCEL_FILE = r"C:\Users\erics\OneDrive\Desktop\Export_Output.xlsx"
+taluk_gdf = gpd.read_file("Karnataka Taluk Boundary.shp")
 
-def csv_to_excel(csv_path, excel_path):
-    df = pd.read_csv(csv_path)
+dist_rows  = taluk_gdf[taluk_gdf["KGISDist_1"].notna()].copy().reset_index(drop=True)
+taluk_rows = taluk_gdf[taluk_gdf["KGISTalukN"].notna()].copy().reset_index(drop=True)
 
-    with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Sheet1")
+dist_rows["dist_code"] = (dist_rows.index + 1).astype(str).str.zfill(2)
+code_to_name = dict(zip(dist_rows["dist_code"], dist_rows["KGISDist_1"]))
 
-        ws = writer.sheets["Sheet1"]
+DISTRICT_FIX = {
+    "Bagalkote":       "Bagalkot",
+    "Kalaburgi":       "Kalaburagi",
+    "Kolara":          "Kolar",
+    "Chamarajanagara": "Chamarajanagar",
+    "Bengaluru South": "Ramanagara",
+}
 
-        # Bold green header row
-        header_fill = PatternFill("solid", fgColor="2E7D32")
-        for cell in ws[1]:
-            cell.font = Font(bold=True, color="FFFFFF", name="Arial")
-            cell.fill = header_fill
-            cell.alignment = Alignment(horizontal="center")
+TALUK_FIX = {
+    "Alnavar":            "Alnavara",
+    "Anekal":             ">nekal",
+    "Babaleshwar":        "Babaleshwara",
+    "Bagalkote":          "Bagalkot",
+    "Bangalore-East":     "Bengaluru-East",
+    "Bangalore-North":    "Bengaluru-North",
+    "Bangalore-South":    "Bengaluru-South",
+    "Bangarpet":          "Bangarapete",
+    "Basavanabagewadi":   "Basavana Bagevadi",
+    "Bilagi":             "Bilgi",
+    "Brahmavara":         "Bramhavara",
+    "Chadchan":           "Chadachana",
+    "Chamarajanagara":    "Chamarajanagar",
+    "Chikkamagaluru":     "Chikkmagaluru",
+    "Chitguppa":          "Chittaguppa",
+    "Chittapur":          "Chitapur",
+    "Dandeli":            "Dandelli",
+    "Doddaballapura":     "Dod Ballapur",
+    "Guledgudda":         "Guledagudda",
+    "Gurmitakal":         "Gurumithakala",
+    "Hadagali":           "Huvina Hadagali",
+    "Hubballi Urban":     "Hubballi",
+    "Hulsoor":            "Hulasur",
+    "Hunasagi":           "Hunisigi",
+    "Jamakhandi":         "Jamkhandi",
+    "Jewargi":            "Jevargi",
+    "Joida":              "Supa",
+    "Kagwad":             "Kagavada",
+    "Kalaburgi":          "Kalaburagi",
+    "Kanakpura":          "Kanakapura",
+    "Kolar Gold Field":   "K.G.F",
+    "Kolara":             "Kolar",
+    "Kolhar":             "Kolhara",
+    "Kollegal":           "Kollegala",
+    "Kotturu":            "Kutturu",
+    "Krishnarajpet":      "Krishnarajapete",
+    "Kukanoor":           "Kukanuru",
+    "Kushalnagar":        "Kushalanagara",
+    "Lingasuguru":        "Lingasugur",
+    "Mangaluru":          "Mangalore",
+    "Moodubidire":        "Mudabidri",
+    "Mudalgi":            "Mudalagi",
+    "Muddebihala":        "Muddebihal",
+    "Navalagund":         "Navalgund",
+    "Pandavpura":         "Pandavapura",
+    "Puttur":             "Putturu",
+    "Rabakavi-Banahatti": "Rabkavi Banhatti",
+    "Ramadurg":           "Ramadurga",
+    "Rattihalli":         "Ratteehalli",
+    "Shahpur":            "Shahapur",
+    "Sindhanuru":         "Sindhanur",
+    "Siruguppa":          "Siraguppa",
+    "Sirwar":             "Sirivara",
+    "Somavarapete":       "Somvarpet",
+    "Sonduru":            "Sanduru",
+    "Srinivaspura":       "Sr\\nivasapura",
+    "Srirangapatna":      "Sr\\rangapatna",
+    "Sullia":             "Sulya",
+    "T.Narasipura":       "T.Naras\\pura",
+    "Talikoti":           "Talikote",
+    "Thirthahalli":       "Th\\rthahalli",
+    "Tumakuru":           "Tumkuru",
+    "Wadagera":           "Vadagera",
+    "Yalandur":           "Yelanduru",
+}
 
-        # Auto-fit column widths
-        for col in ws.columns:
-            max_len = max((len(str(cell.value)) if cell.value else 0) for cell in col)
-            ws.column_dimensions[col[0].column_letter].width = min(max_len + 4, 50)
+taluk_rows["dist_code"] = taluk_rows["KGISTalukC"].astype(str).str[:2]
+taluk_rows["DISTRICT"]  = taluk_rows["dist_code"].map(code_to_name).replace(DISTRICT_FIX)
+taluk_rows["SUB_DIST"]  = taluk_rows["KGISTalukN"].astype(str).str.strip().replace(TALUK_FIX)
+dist_rows["DISTRICT"]   = dist_rows["KGISDist_1"].replace(DISTRICT_FIX)
 
-    print(f"Saved: {excel_path}")
+dist_rows  = dist_rows.to_crs(epsg=4326)
+taluk_rows = taluk_rows.to_crs(epsg=4326)
 
-if not os.path.exists(CSV_FILE):
-    print(f"ERROR: File not found — {CSV_FILE}")
-else:
-    csv_to_excel(CSV_FILE, EXCEL_FILE)
-    print("Done! Export_Output.xlsx saved to Desktop.")
+district_out = dist_rows[["DISTRICT", "geometry"]].dissolve(by="DISTRICT").reset_index()
+district_out["geometry"] = district_out["geometry"].simplify(0.001, preserve_topology=True)
+district_out.to_file("district_boundaries.geojson", driver="GeoJSON")
+print(f"Districts: {len(district_out)}")
+
+taluk_out = taluk_rows[["DISTRICT", "SUB_DIST", "geometry"]].copy()
+taluk_out = taluk_out[taluk_out["DISTRICT"].notna()]
+taluk_out["geometry"] = taluk_out["geometry"].simplify(0.001, preserve_topology=True)
+taluk_out.to_file("taluk_boundaries.geojson", driver="GeoJSON")
+print(f"Taluks: {len(taluk_out)}")
+
+village_df = pd.read_excel("combined_village_data.xlsx", engine="openpyxl")
+village_df["SUB_DIST"] = village_df["SUB_DIST"].astype(str).str.strip()
+
+with open("taluk_boundaries.geojson") as f:
+    t = json.load(f)
+
+geojson_taluks = set(f["properties"]["SUB_DIST"] for f in t["features"])
+excel_taluks   = set(village_df["SUB_DIST"].unique())
+
+print("\nGeoJSON not in Excel:", sorted(geojson_taluks - excel_taluks))
+print("Excel not in GeoJSON:", sorted(excel_taluks - geojson_taluks))
+print("Matched:", len(geojson_taluks & excel_taluks))

@@ -4,9 +4,12 @@ if sys.platform == "win32" and sys.version_info >= (3, 14):
     asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
 
 import os
+import json
+import hashlib
 import requests
 import streamlit as st
 import pandas as pd
+import geopandas as gpd
 from scipy.spatial import cKDTree
 from groq import Groq
 import edge_tts
@@ -20,6 +23,10 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 from reportlab.lib.units import cm
 
+# Map imports
+import folium
+from streamlit_folium import st_folium
+
 # ── API key (from Streamlit secrets, never hardcoded) ──────────
 groq_client = Groq(api_key=st.secrets["GROQ_API_KEY"])
 
@@ -27,12 +34,18 @@ groq_client = Groq(api_key=st.secrets["GROQ_API_KEY"])
 BASE = os.path.dirname(os.path.abspath(__file__))
 CSV_URL = "https://huggingface.co/datasets/ricu9656/karnataka-soil-data/resolve/main/Export_Output.csv"
 CSV_PATH = os.path.join(BASE, "Export_Output.csv")
+VILLAGE_GEOJSON_PATH = os.path.join(BASE, "village_boundaries_simplified_v3.geojson")
+DISTRICT_GEOJSON_PATH = os.path.join(BASE, "district_boundaries.geojson")
+TALUK_GEOJSON_PATH = os.path.join(BASE, "taluk_boundaries.geojson")
 
 # ── Data loading ──────────────────────────────────────────────
 @st.cache_data
 def load_village_data():
     df = pd.read_excel(os.path.join(BASE, "combined_village_data.xlsx"), engine="openpyxl")
     df = df[df['KGISVill_2'].notna() & (df['KGISVill_2'].str.strip() != '')]
+    df = df[df['latitude'].notna() & df['longitude'].notna()]
+    for col in ["DISTRICT", "SUB_DIST", "KGISVill_2"]:
+        df[col] = df[col].astype(str).str.strip()
     return df
 
 @st.cache_data
@@ -54,6 +67,58 @@ def load_csv_data():
     df = df[df['latitude'].notna() & df['longitude'].notna()]
     return df
 
+@st.cache_data
+def load_village_boundaries():
+    """Village polygon boundaries, joined to DISTRICT/SUB_DIST via merger.py output.
+
+    Some districts (e.g. Uttara Kannada) ship with a blank KGISVill_2 in the source
+    geojson for every polygon — the original merge never attached village names for
+    that district. We patch those in here: for each polygon with a missing name, take
+    its centroid and match it to the nearest point in combined_village_data.xlsx
+    within the same DISTRICT + SUB_DIST (which does have correct names).
+    """
+    gdf = gpd.read_file(VILLAGE_GEOJSON_PATH)
+    gdf = gdf[gdf["DISTRICT"].notna()]  # drop unjoinable shapefile rows — no soil data possible
+    gdf["DISTRICT"] = gdf["DISTRICT"].astype(str).str.strip()
+    gdf["SUB_DIST"] = gdf["SUB_DIST"].astype(str).str.strip()
+    gdf["KGISVill_2"] = gdf["KGISVill_2"].astype(str).str.strip()
+    gdf.loc[gdf["KGISVill_2"].isin(["None", "nan", ""]), "KGISVill_2"] = None
+
+    missing_mask = gdf["KGISVill_2"].isna()
+    if missing_mask.any():
+        vdf = load_village_data()  # has correct names + lat/lon, cached
+        filled_names = []
+        for idx in gdf.loc[missing_mask].index:
+            row = gdf.loc[idx]
+            centroid = row.geometry.centroid
+            candidates = vdf[
+                (vdf["DISTRICT"] == row["DISTRICT"]) &
+                (vdf["SUB_DIST"] == row["SUB_DIST"])
+            ]
+            if candidates.empty:
+                filled_names.append(None)
+                continue
+            dists = (candidates["latitude"] - centroid.y) ** 2 + (candidates["longitude"] - centroid.x) ** 2
+            nearest_name = candidates.loc[dists.idxmin(), "KGISVill_2"]
+            filled_names.append(nearest_name)
+        gdf.loc[missing_mask, "KGISVill_2"] = filled_names
+        gdf["KGISVill_2"] = gdf["KGISVill_2"].fillna("Unknown")
+
+    return gdf
+
+@st.cache_data
+def get_district_boundaries():
+    gdf = gpd.read_file(DISTRICT_GEOJSON_PATH)
+    gdf["DISTRICT"] = gdf["DISTRICT"].astype(str).str.strip()
+    return gdf
+
+@st.cache_data
+def get_taluk_boundaries(district):
+    gdf = gpd.read_file(TALUK_GEOJSON_PATH)
+    gdf["DISTRICT"] = gdf["DISTRICT"].astype(str).str.strip()
+    gdf["SUB_DIST"] = gdf["SUB_DIST"].astype(str).str.strip()
+    return gdf[gdf["DISTRICT"] == district]
+
 @st.cache_resource
 def get_village_tree(_df):
     return cKDTree(_df[["latitude", "longitude"]].values)
@@ -66,15 +131,9 @@ village_df = load_village_data()
 csv_df     = load_csv_data()
 village_tree = get_village_tree(village_df)
 csv_tree     = get_csv_tree(csv_df)
+village_boundaries_gdf = load_village_boundaries()
 
-# ── IDW estimation ──────────────────────────────────────────────
 def idw_estimate(tree, df, lat, lon, columns, k=4, power=2, max_dist_deg=0.01):
-    """
-    Estimate values at (lat, lon) using inverse-distance weighting
-    over the k nearest points in df (indexed by tree).
-    max_dist_deg: sanity cutoff (~0.01 deg ≈ 1.1km). If even the nearest
-    point is farther than this, there's no real coverage here -> return None.
-    """
     distances, indices = tree.query([[lat, lon]], k=k)
     distances = distances[0]
     indices = indices[0]
@@ -109,7 +168,6 @@ def depth_interp(v):
     elif v < 75: return f"{v} cm — Moderate. Suitable for most crops."
     else:         return f"{v} cm — Deep. Suitable for all crops."
 
-# ── Texture: bulk-density value -> soil type band ───────────────
 TEXTURE_BANDS = [
     (1.45, "Clay"),
     (1.48, "Sandy Clay"),
@@ -122,12 +180,11 @@ TEXTURE_BANDS = [
 ]
 
 def texture_soil_type(v):
-    """Map raw texture/bulk-density value to a soil-type label."""
     v = float(v)
     for upper, label in TEXTURE_BANDS:
         if v <= upper:
             return label
-    return "Sand"  # anything above 1.69 falls in the coarsest band
+    return "Sand"
 
 TEXTURE_NOTES = {
     "Clay":            "Heavy, high water retention, poor drainage.",
@@ -230,6 +287,23 @@ def keyword_response(query, record, location_name="Selected location"):
         return f"**Fertility — {name}:** {rating} ({score}/4)"
     return None
 
+# ── Village compare helper (used by both Compare mode UI and chat) ─
+def compare_villages(rec_a, rec_b):
+    """Returns a DataFrame comparing two soil records. rec_a/rec_b are
+    pandas Series with SOC/DEPTH/TEXTURE/PH/KGISVill_2 fields."""
+    rows = [
+        ("SOC (%)",     f"{float(rec_a['SOC']):.2f}",           f"{float(rec_b['SOC']):.2f}",           float(rec_a['SOC']) - float(rec_b['SOC'])),
+        ("Depth (cm)",  f"{round(float(rec_a['DEPTH']))}",      f"{round(float(rec_b['DEPTH']))}",      float(rec_a['DEPTH']) - float(rec_b['DEPTH'])),
+        ("Texture",     texture_soil_type(rec_a['TEXTURE']),    texture_soil_type(rec_b['TEXTURE']),    None),
+        ("pH",          f"{float(rec_a['PH']):.2f}",            f"{float(rec_b['PH']):.2f}",            float(rec_a['PH']) - float(rec_b['PH'])),
+    ]
+    score_a, score_b = fertility_score(rec_a), fertility_score(rec_b)
+    rating = ["Poor", "Low", "Moderate", "Good", "Excellent"]
+    rows.append(("Fertility", f"{rating[score_a]} ({score_a}/4)", f"{rating[score_b]} ({score_b}/4)", score_a - score_b))
+
+    df = pd.DataFrame(rows, columns=["Parameter", str(rec_a['KGISVill_2']), str(rec_b['KGISVill_2']), "Diff (A − B)"])
+    return df, score_a, score_b
+
 # ── PDF report ─────────────────────────────────────────────────
 def generate_pdf_report(record, village_name=None):
     buffer = io.BytesIO()
@@ -292,6 +366,88 @@ def speak_text(text):
         return None
 
 # ══════════════════════════════════════════════════════════════
+# Map drill-down helpers (boundary-based)
+# ══════════════════════════════════════════════════════════════
+def gdf_to_geojson(gdf):
+    return json.loads(gdf.to_json())
+
+def feature_bounds_from_geom(geom):
+    minx, miny, maxx, maxy = geom.bounds
+    return [[miny, minx], [maxy, maxx]]
+
+# ── Per-feature color palette (used for district-level coloring) ──
+DISTRICT_PALETTE = [
+    "#e57373", "#64b5f6", "#81c784", "#ffb74d", "#ba68c8",
+    "#4db6ac", "#f06292", "#a1887f", "#90a4ae", "#dce775",
+    "#4fc3f7", "#ff8a65", "#9575cd", "#aed581", "#7986cb",
+    "#fff176", "#4dd0e1", "#f8bbd0", "#c5e1a5", "#ffd54f",
+    "#ef9a9a", "#80cbc4", "#ce93d8", "#fff59d", "#b0bec5",
+    "#c5cae9", "#ffcc80", "#a5d6a7", "#f48fb1", "#bcaaa4",
+]
+
+def color_for_name(name):
+    """Stable hash → palette index. Uses md5 instead of built-in hash()
+    because str hash() is randomized per-process (PYTHONHASHSEED),
+    which would reshuffle district colors on every restart."""
+    h = int(hashlib.md5(str(name).encode()).hexdigest(), 16)
+    return DISTRICT_PALETTE[h % len(DISTRICT_PALETTE)]
+
+def add_boundary_layer(m, geojson_data, name_key, fill_color="#4caf50",
+                        border_color="#1a4d1a", color_by_feature=False):
+    # Fill in missing/blank names so the tooltip never renders as an empty pill
+    for feature in geojson_data.get("features", []):
+        props = feature.get("properties", {})
+        val = props.get(name_key)
+        if val is None or str(val).strip() == "":
+            props[name_key] = "Unknown"
+
+    def style_fn(f):
+        if color_by_feature:
+            c = color_for_name(f["properties"].get(name_key, ""))
+            return {"fillColor": c, "color": "#333333", "weight": 1.2, "fillOpacity": 0.45}
+        return {"fillColor": fill_color, "color": border_color, "weight": 1.5, "fillOpacity": 0.25}
+
+    folium.GeoJson(
+        geojson_data,
+        style_function=style_fn,
+        highlight_function=lambda f: {"fillColor": "#ffb300", "color": "#e65100", "weight": 2.5, "fillOpacity": 0.55},
+        tooltip=folium.GeoJsonTooltip(
+            fields=[name_key],
+            labels=False,      # show only the value, no field name prefix
+            sticky=True,       # tooltip follows the cursor and appears reliably on hover
+            style="""
+                background-color: #ffffff !important;
+                color: #1a3a1a !important;
+                font-weight: 600 !important;
+                font-size: 13px !important;
+                padding: 4px 8px !important;
+                border: 1px solid #a5d6a7 !important;
+                border-radius: 4px !important;
+                white-space: nowrap !important;
+            """,
+        ),
+    ).add_to(m)
+
+def init_map_state():
+    defaults = {
+        "map_level": "district",
+        "sel_district": None,
+        "sel_subdist": None,
+        "sel_village": None,
+        "zoom_bounds": None,
+    }
+    for key, default in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = default
+
+def reset_map_selection():
+    st.session_state.map_level = "district"
+    st.session_state.sel_district = None
+    st.session_state.sel_subdist = None
+    st.session_state.sel_village = None
+    st.session_state.zoom_bounds = None
+
+# ══════════════════════════════════════════════════════════════
 # UI
 # ══════════════════════════════════════════════════════════════
 st.set_page_config(page_title="Karnataka Soil Chatbot", page_icon="🌱", layout="wide")
@@ -323,15 +479,19 @@ section[data-testid="stSidebar"] label { color: #d4edda !important; }
 
 st.markdown("<h1>🌱 Karnataka Soil Chatbot</h1>", unsafe_allow_html=True)
 
-search_mode = st.radio("Search by", ["District / Sub-district / Village", "Latitude & Longitude"])
+search_mode = st.radio(
+    "Search by",
+    ["District / Sub-district / Village (dropdown)", "Map (click to select)",
+     "Latitude & Longitude", "Compare Two Villages"]
+)
 
 record           = None
 nearest_village  = None
 input_lat = input_lon = None
 location_label   = "Selected location"
 
-# ── Mode 1: Village picker ─────────────────────────────────────
-if search_mode == "District / Sub-district / Village":
+# ── Mode 1: Dropdown picker ──────────────────────────────────
+if search_mode == "District / Sub-district / Village (dropdown)":
     selected_district = st.selectbox("District", sorted(village_df["DISTRICT"].dropna().astype(str).unique()))
     sub_df = village_df[village_df["DISTRICT"].astype(str) == selected_district]
     selected_subdist = st.selectbox("Sub-district", sorted(sub_df["SUB_DIST"].dropna().astype(str).unique()))
@@ -340,8 +500,112 @@ if search_mode == "District / Sub-district / Village":
     record = vill_df[vill_df["KGISVill_2"].astype(str) == selected_village].iloc[0]
     location_label = str(record["KGISVill_2"])
 
-# ── Mode 2: Lat/Lon — IDW estimate from CSV + show nearest village ────
-else:
+# ── Mode 2: Map-based drill-down picker (boundary polygons) ─────
+elif search_mode == "Map (click to select)":
+    init_map_state()
+
+    st.markdown("### 🗺️ Click the map: District → Sub-district → Village")
+
+    b1, b2, b3, _ = st.columns([1, 1, 1, 3])
+    if b1.button("⟲ Reset", key="btn_reset_map"):
+        reset_map_selection()
+        st.rerun()
+    if st.session_state.sel_district and b2.button(f"◀ {st.session_state.sel_district}", key="btn_back_district"):
+        st.session_state.map_level = "district"
+        st.session_state.sel_district = None
+        st.session_state.sel_subdist = None
+        st.session_state.sel_village = None
+        st.session_state.zoom_bounds = None
+        st.rerun()
+    if st.session_state.sel_subdist and b3.button(f"◀ {st.session_state.sel_subdist}", key="btn_back_subdist"):
+        st.session_state.map_level = "subdistrict"
+        st.session_state.sel_subdist = None
+        st.session_state.sel_village = None
+        st.rerun()
+
+    # ---- LEVEL 1: districts ----
+    if st.session_state.map_level == "district":
+        district_gdf = get_district_boundaries()
+        m = folium.Map(location=[15.3, 75.7], zoom_start=7, tiles="CartoDB positron")
+        add_boundary_layer(m, gdf_to_geojson(district_gdf), "DISTRICT", color_by_feature=True)
+        map_data = st_folium(m, height=520, width=None, key="district_map")
+        clicked = map_data.get("last_active_drawing")
+        if clicked:
+            name = clicked["properties"]["DISTRICT"].strip()
+            if name != st.session_state.sel_district:
+                row = district_gdf[district_gdf["DISTRICT"] == name].iloc[0]
+                st.session_state.sel_district = name
+                st.session_state.sel_subdist = None
+                st.session_state.sel_village = None
+                st.session_state.map_level = "subdistrict"
+                st.session_state.zoom_bounds = feature_bounds_from_geom(row.geometry)
+                st.rerun()
+
+    # ---- LEVEL 2: sub-districts ----
+    elif st.session_state.map_level == "subdistrict":
+        taluk_gdf = get_taluk_boundaries(st.session_state.sel_district)
+        if taluk_gdf.empty:
+            st.error(f"No boundary data found for district '{st.session_state.sel_district}'. Click Reset.")
+        else:
+            m = folium.Map(tiles="CartoDB positron")
+            m.fit_bounds(st.session_state.zoom_bounds)
+            add_boundary_layer(m, gdf_to_geojson(taluk_gdf), "SUB_DIST", fill_color="#4caf50", border_color="#1a4d1a")
+            map_data = st_folium(m, height=520, width=None, key="subdist_map")
+            clicked = map_data.get("last_active_drawing")
+            if clicked:
+                name = clicked["properties"]["SUB_DIST"].strip()
+                if name != st.session_state.sel_subdist:
+                    row = taluk_gdf[taluk_gdf["SUB_DIST"] == name].iloc[0]
+                    st.session_state.sel_subdist = name
+                    st.session_state.sel_village = None
+                    st.session_state.map_level = "village"
+                    st.session_state.zoom_bounds = feature_bounds_from_geom(row.geometry)
+                    st.rerun()
+
+    # ---- LEVEL 3: villages ----
+    elif st.session_state.map_level == "village":
+        vill_gdf = village_boundaries_gdf[
+            (village_boundaries_gdf["DISTRICT"] == st.session_state.sel_district) &
+            (village_boundaries_gdf["SUB_DIST"] == st.session_state.sel_subdist)
+        ]
+        if vill_gdf.empty:
+            st.error(
+                f"No village boundaries found for sub-district '{st.session_state.sel_subdist}' in "
+                f"'{st.session_state.sel_district}'. Click Reset and try again."
+            )
+        else:
+            m = folium.Map(tiles="CartoDB positron")
+            m.fit_bounds(st.session_state.zoom_bounds)
+            add_boundary_layer(m, gdf_to_geojson(vill_gdf), "KGISVill_2", fill_color="#ff9800", border_color="#e65100")
+            map_data = st_folium(m, height=520, width=None, key="village_map")
+            clicked = map_data.get("last_active_drawing")
+            if clicked:
+                name = clicked["properties"]["KGISVill_2"].strip()
+                if name != st.session_state.sel_village:
+                    st.session_state.sel_village = name
+                    st.rerun()
+
+    if st.session_state.sel_village:
+        target_village = st.session_state.sel_village.strip()
+        matches = village_df[village_df["KGISVill_2"].astype(str).str.strip() == target_village]
+        if st.session_state.sel_subdist:
+            matches = matches[matches["SUB_DIST"].astype(str).str.strip() == st.session_state.sel_subdist.strip()]
+        if st.session_state.sel_district:
+            matches = matches[matches["DISTRICT"].astype(str).str.strip() == st.session_state.sel_district.strip()]
+
+        if matches.empty:
+            record = None
+            st.warning("Could not match the selected village to soil data — please click Reset and try again.")
+        else:
+            record = matches.iloc[0]
+            location_label = str(record["KGISVill_2"])
+            st.success(f"📍 Selected: **{location_label}** ({st.session_state.sel_subdist}, {st.session_state.sel_district})")
+    else:
+        record = None
+        st.info("Click a district boundary, then a sub-district boundary, then a village boundary.")
+
+# ── Mode 3: Lat/Lon — IDW estimate from CSV + show nearest village ────
+elif search_mode == "Latitude & Longitude":
     col_a, col_b = st.columns(2)
     input_lat = col_a.number_input("Latitude",  format="%.6f", value=15.0)
     input_lon = col_b.number_input("Longitude", format="%.6f", value=75.0)
@@ -370,6 +634,41 @@ else:
 
         record = csv_record
         location_label = f"{input_lat:.4f}, {input_lon:.4f} (near {nearest_village['KGISVill_2']})"
+
+# ── Mode 4: Compare Two Villages — side by side + diff table ───
+else:
+    st.markdown("### ⚖️ Compare Two Villages")
+
+    def village_picker(label_prefix, key_prefix):
+        d = st.selectbox(f"{label_prefix} District", sorted(village_df["DISTRICT"].dropna().astype(str).unique()), key=f"{key_prefix}_d")
+        sub = village_df[village_df["DISTRICT"].astype(str) == d]
+        s = st.selectbox(f"{label_prefix} Sub-district", sorted(sub["SUB_DIST"].dropna().astype(str).unique()), key=f"{key_prefix}_s")
+        vill = sub[sub["SUB_DIST"].astype(str) == s]
+        v = st.selectbox(f"{label_prefix} Village", sorted(vill["KGISVill_2"].dropna().astype(str).unique()), key=f"{key_prefix}_v")
+        return vill[vill["KGISVill_2"].astype(str) == v].iloc[0]
+
+    col_x, col_y = st.columns(2)
+    with col_x:
+        rec_a = village_picker("Village A —", "cmp_a")
+    with col_y:
+        rec_b = village_picker("Village B —", "cmp_b")
+
+    compare_df, score_a, score_b = compare_villages(rec_a, rec_b)
+    st.dataframe(compare_df, use_container_width=True, hide_index=True)
+
+    st.markdown("#### 🗺️ Locations")
+    st.map(pd.DataFrame({
+        "lat": [rec_a["latitude"], rec_b["latitude"]],
+        "lon": [rec_a["longitude"], rec_b["longitude"]],
+    }))
+
+    if score_a != score_b:
+        winner = rec_a['KGISVill_2'] if score_a > score_b else rec_b['KGISVill_2']
+        st.success(f"🏆 **{winner}** has better overall soil fertility.")
+    else:
+        st.info("Both villages have equal fertility scores.")
+
+    st.stop()
 
 # ══════════════════════════════════════════════════════════════
 # Metrics display
@@ -459,7 +758,7 @@ else:
 # PDF export
 # ══════════════════════════════════════════════════════════════
 st.markdown("---")
-if st.button("📄 Export PDF Report"):
+if st.button("📄 Export PDF Report", key="btn_export_pdf"):
     pdf_buffer = generate_pdf_report(record, village_name=location_label)
     st.download_button(
         label="⬇️ Download Report",
