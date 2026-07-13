@@ -48,6 +48,20 @@ def load_village_data():
     df = df[df['latitude'].notna() & df['longitude'].notna()]
     for col in ["DISTRICT", "SUB_DIST", "KGISVill_2"]:
         df[col] = df[col].astype(str).str.strip()
+
+    # ── memory: DISTRICT/SUB_DIST repeat heavily across 45k rows → category
+    # dtype stores each unique string once instead of once per row. KGISVill_2
+    # is left as-is: too high-cardinality (near-unique) for category to help.
+    for col in ["DISTRICT", "SUB_DIST"]:
+        df[col] = df[col].astype("category")
+    # latitude/longitude stay float64 on purpose: numpy.float64 subclasses
+    # Python's built-in float so json.dumps handles it fine, but float32 does
+    # NOT — and lat/lon end up JSON-serialized via st.map/deck.gl. Downcasting
+    # them crashes st.map with "Object of type float32 is not JSON serializable".
+    float_cols = [c for c in df.select_dtypes(include="float64").columns
+                  if c not in ("latitude", "longitude")]
+    df[float_cols] = df[float_cols].astype("float32")
+
     return df
 
 @st.cache_data
@@ -67,6 +81,17 @@ def load_csv_data():
         "Longitude": "longitude",
     })
     df = df[df['latitude'].notna() & df['longitude'].notna()]
+
+    # ── memory: this is the dense HuggingFace raster-style CSV — float64 by
+    # default. float32 halves its footprint with no meaningful precision loss
+    # for IDW interpolation over soil readings. latitude/longitude excluded —
+    # same reason as load_village_data: float32 isn't JSON-serializable,
+    # unlike float64, and coordinate columns are the ones that tend to end up
+    # passed to st.map/folium/JSON paths.
+    float_cols = [c for c in df.select_dtypes(include="float64").columns
+                  if c not in ("latitude", "longitude")]
+    df[float_cols] = df[float_cols].astype("float32")
+
     return df
 
 @st.cache_data
@@ -133,7 +158,11 @@ village_df = load_village_data()
 csv_df     = load_csv_data()
 village_tree = get_village_tree(village_df)
 csv_tree     = get_csv_tree(csv_df)
-village_boundaries_gdf = load_village_boundaries()
+# village_boundaries_gdf is NOT loaded here — it's the heaviest asset (full-res
+# village polygons for the whole state) and most sessions never touch Map mode's
+# village level. Loaded lazily below, right where it's first used. Still
+# @st.cache_data, so this only costs time once per server process, not once per
+# session — every session after the first hits the cache instantly.
 
 def idw_estimate(tree, df, lat, lon, columns, k=4, power=2, max_dist_deg=0.01):
     distances, indices = tree.query([[lat, lon]], k=k)
@@ -1032,7 +1061,7 @@ section[data-testid="stSidebar"] label { color: #d4edda !important; }
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown("<h1>🌱 SoilMitra AI – South Indian Soil Intelligence and Advisory System</h1>", unsafe_allow_html=True)
+st.markdown("<h1>🌱 Karnataka Soil Chatbot</h1>", unsafe_allow_html=True)
 
 search_mode = st.radio(
     "Search by",
@@ -1153,6 +1182,7 @@ elif search_mode == "Map (click to select)":
 
     # ---- LEVEL 3: villages ----
     elif st.session_state.map_level == "village":
+        village_boundaries_gdf = load_village_boundaries()  # lazy — cached after first call
         vill_gdf = village_boundaries_gdf[
             (village_boundaries_gdf["DISTRICT"] == st.session_state.sel_district) &
             (village_boundaries_gdf["SUB_DIST"] == st.session_state.sel_subdist)
@@ -1261,7 +1291,7 @@ else:
         rec_b = village_picker("Village B —", "cmp_b")
 
     compare_df, score_a, score_b = compare_villages(rec_a, rec_b)
-    st.dataframe(compare_df, use_container_width=True, hide_index=True)
+    st.dataframe(compare_df, width='stretch', hide_index=True)
 
     st.markdown("#### 🗺️ Locations")
     st.map(pd.DataFrame({
@@ -1357,7 +1387,7 @@ if record is not None:
                 "Min Temp (°C)": temp_min,
                 "Rain (mm)": precip_sum,
             })
-            st.dataframe(forecast_df, use_container_width=True, hide_index=True)
+            st.dataframe(forecast_df, width='stretch', hide_index=True)
     else:
         st.warning("Weather data unavailable right now.")
 
@@ -1427,7 +1457,7 @@ if query:
         rec_b = village_df[village_df["KGISVill_2"] == name_b].iloc[0]
         compare_df, score_a, score_b = compare_villages(rec_a, rec_b)
 
-        st.chat_message("assistant").dataframe(compare_df, use_container_width=True, hide_index=True)
+        st.chat_message("assistant").dataframe(compare_df, width='stretch', hide_index=True)
         if score_a != score_b:
             winner = name_a if score_a > score_b else name_b
             answer = f"🏆 {winner} has better overall soil fertility ({max(score_a, score_b)}/4 vs {min(score_a, score_b)}/4)."
