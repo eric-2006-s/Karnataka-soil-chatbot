@@ -1,14 +1,46 @@
-streamlit
-pandas
-geopandas
-scipy
-groq
-edge-tts
-deep-translator
-streamlit-mic-recorder
-reportlab
-folium
-streamlit-folium
-matplotlib
-requests
-openpyxl
+# ── Core app ─────────────────────────────────────────────────
+streamlit==1.59.1
+
+# ── Data ─────────────────────────────────────────────────────
+# pandas 2.2.x is the last well-established line before the 3.0 major bump —
+# geopandas/pyogrio are widely tested against it. pandas 3.0 is too new;
+# skip it until the geospatial stack has caught up.
+pandas==2.2.3
+numpy==1.26.4
+pyarrow==17.0.0
+openpyxl==3.1.5
+scipy==1.13.1
+
+# ── Geospatial ───────────────────────────────────────────────
+# This combo (geopandas 1.0.1 + shapely 2.0.x + pyproj 3.6.x + pyogrio 0.9.x)
+# is a well-tested, mutually-compatible set — avoids the newest point
+# releases of each that may not yet be validated together.
+geopandas==1.0.1
+shapely==2.0.4
+pyproj==3.6.1
+pyogrio==0.9.0
+
+# ── Maps ─────────────────────────────────────────────────────
+folium==0.17.0
+streamlit-folium==0.23.1
+
+# ── Plotting / PDF ───────────────────────────────────────────
+matplotlib==3.9.2
+reportlab==4.2.5
+
+# ── Spatial index ────────────────────────────────────────────
+# (scipy above already provides cKDTree — no separate package needed)
+
+# ── Voice / translation ──────────────────────────────────────
+groq==0.11.0
+edge-tts==6.1.19
+deep-translator==1.11.4
+streamlit-mic-recorder==0.0.8
+SpeechRecognition==3.10.4
+
+# ── HTTP ─────────────────────────────────────────────────────
+requests==2.32.3
+# httpx 0.28+ removed the 'proxies' kwarg that groq==0.11.0 still passes
+# internally when building its httpx.Client — pin below that line or Groq(...)
+# throws "Client.__init__() got an unexpected keyword argument 'proxies'".
+httpx==0.27.2
