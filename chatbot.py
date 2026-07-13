@@ -9,7 +9,6 @@ import hashlib
 import requests
 import streamlit as st
 import pandas as pd
-import geopandas as gpd
 from scipy.spatial import cKDTree
 from groq import Groq
 import edge_tts
@@ -17,17 +16,12 @@ from deep_translator import GoogleTranslator
 from streamlit_mic_recorder import mic_recorder
 import tempfile
 import io
-from reportlab.lib.pagesizes import A4
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib import colors
-from reportlab.lib.units import cm
-
-# Map imports
-import folium
-from streamlit_folium import st_folium
-import matplotlib as mpl
-import matplotlib.colors as mcolors
+# geopandas, reportlab, folium/streamlit_folium, and matplotlib are NOT
+# imported here. They're heavy (compiled C deps: GDAL/GEOS/PROJ for geopandas,
+# a full font/graphics stack for reportlab and matplotlib) and were previously
+# loaded into every session's memory at startup regardless of whether that
+# session ever used the map or exported a PDF. They're imported locally,
+# right inside the functions that actually use them, further down this file.
 
 # ── API key (from Streamlit secrets, never hardcoded) ──────────
 groq_client = Groq(api_key=st.secrets["GROQ_API_KEY"])
@@ -39,6 +33,8 @@ CSV_PATH = os.path.join(BASE, "Export_Output.csv")
 VILLAGE_GEOJSON_PATH = os.path.join(BASE, "village_boundaries_simplified_v3.geojson")
 DISTRICT_GEOJSON_PATH = os.path.join(BASE, "district_boundaries.geojson")
 TALUK_GEOJSON_PATH = os.path.join(BASE, "taluk_boundaries.geojson")
+
+
 
 # ── Data loading ──────────────────────────────────────────────
 @st.cache_data
@@ -104,6 +100,7 @@ def load_village_boundaries():
     its centroid and match it to the nearest point in combined_village_data.xlsx
     within the same DISTRICT + SUB_DIST (which does have correct names).
     """
+    import geopandas as gpd
     gdf = gpd.read_file(VILLAGE_GEOJSON_PATH)
     gdf = gdf[gdf["DISTRICT"].notna()]  # drop unjoinable shapefile rows — no soil data possible
     gdf["DISTRICT"] = gdf["DISTRICT"].astype(str).str.strip()
@@ -135,12 +132,14 @@ def load_village_boundaries():
 
 @st.cache_data
 def get_district_boundaries():
+    import geopandas as gpd
     gdf = gpd.read_file(DISTRICT_GEOJSON_PATH)
     gdf["DISTRICT"] = gdf["DISTRICT"].astype(str).str.strip()
     return gdf
 
 @st.cache_data
 def get_taluk_boundaries(district):
+    import geopandas as gpd
     gdf = gpd.read_file(TALUK_GEOJSON_PATH)
     gdf["DISTRICT"] = gdf["DISTRICT"].astype(str).str.strip()
     gdf["SUB_DIST"] = gdf["SUB_DIST"].astype(str).str.strip()
@@ -484,6 +483,11 @@ def format_ranking_answer(param_col, order, district_filter, subdist_filter, df_
 
 def generate_ranking_pdf(df_result, param_col, order, district_filter, subdist_filter=None):
     """PDF export of a ranking result table (top N villages by a parameter)."""
+    from reportlab.lib.pagesizes import A4
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib import colors
+    from reportlab.lib.units import cm
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4, topMargin=2*cm, bottomMargin=2*cm,
                             leftMargin=2*cm, rightMargin=2*cm)
@@ -605,6 +609,11 @@ def nearest_result_to_csv_bytes(df_result, param_col):
 
 def generate_nearest_pdf(df_result, param_col, target_value, district_filter):
     """PDF export of a nearest-value result table (N villages closest to a target)."""
+    from reportlab.lib.pagesizes import A4
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib import colors
+    from reportlab.lib.units import cm
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4, topMargin=2*cm, bottomMargin=2*cm,
                             leftMargin=2*cm, rightMargin=2*cm)
@@ -740,6 +749,11 @@ def range_result_to_csv_bytes(df_result, param_col):
 
 def generate_range_pdf(df_result, param_col, lo, hi, district_filter, subdist_filter=None):
     """PDF export of a range-query result table (villages within [lo, hi])."""
+    from reportlab.lib.pagesizes import A4
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib import colors
+    from reportlab.lib.units import cm
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4, topMargin=2*cm, bottomMargin=2*cm,
                             leftMargin=2*cm, rightMargin=2*cm)
@@ -813,6 +827,11 @@ def detect_compare_query(q):
 
 # ── PDF report ─────────────────────────────────────────────────
 def generate_pdf_report(record, village_name=None):
+    from reportlab.lib.pagesizes import A4
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib import colors
+    from reportlab.lib.units import cm
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4, topMargin=2*cm, bottomMargin=2*cm,
                             leftMargin=2*cm, rightMargin=2*cm)
@@ -905,6 +924,7 @@ def add_boundary_layer(m, geojson_data, name_key, fill_color="#4caf50",
     """value_color_map: optional {name: hex_color} to color features by a
     continuous value (choropleth) instead of a categorical hash.
     value_labels: optional {name: "display value string"} shown in the tooltip."""
+    import folium
     # Fill in missing/blank names so the tooltip never renders as an empty pill
     for feature in geojson_data.get("features", []):
         props = feature.get("properties", {})
@@ -976,6 +996,8 @@ def compute_choropleth(df_source, group_col, param_col, cmap_name="RdYlGn_r"):
         return {}, {}, (None, None)
 
     vmin, vmax = float(avg.min()), float(avg.max())
+    import matplotlib as mpl
+    import matplotlib.colors as mcolors
     norm = mcolors.Normalize(vmin=vmin, vmax=vmax) if vmax > vmin else mcolors.Normalize(vmin=vmin - 1, vmax=vmax + 1)
     cmap = mpl.colormaps[cmap_name]
 
@@ -1087,6 +1109,8 @@ if search_mode == "District / Sub-district / Village (dropdown)":
 
 # ── Mode 2: Map-based drill-down picker (boundary polygons) ─────
 elif search_mode == "Map (click to select)":
+    import folium
+    from streamlit_folium import st_folium
     init_map_state()
 
     st.markdown("### 🗺️ Click the map: District → Sub-district → Village")
