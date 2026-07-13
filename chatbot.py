@@ -26,6 +26,8 @@ from reportlab.lib.units import cm
 # Map imports
 import folium
 from streamlit_folium import st_folium
+import matplotlib as mpl
+import matplotlib.colors as mcolors
 
 # ── API key (from Streamlit secrets, never hardcoded) ──────────
 groq_client = Groq(api_key=st.secrets["GROQ_API_KEY"])
@@ -201,6 +203,19 @@ def texture_interp(v):
     soil_type = texture_soil_type(v)
     return f"{soil_type} — {TEXTURE_NOTES.get(soil_type, '')}"
 
+# Fixed category colors for texture soil types — dark/heavy (clay) to
+# light/coarse (sand), so the map reads intuitively even without the legend.
+TEXTURE_TYPE_COLORS = {
+    "Clay":            "#5b3a29",
+    "Sandy Clay":      "#8a5a3c",
+    "Clay Loam":       "#a97450",
+    "Loam":            "#6b8e23",
+    "Sandy Clay Loam": "#c9a227",
+    "Sandy Loam":      "#e0b96b",
+    "Loamy Sand":      "#f0d18c",
+    "Sand":            "#f5e6b8",
+}
+
 def ph_interp(v):
     v = float(v)
     if v < 5.5:   return f"{v:.2f} — Strongly acidic. Lime needed."
@@ -304,6 +319,469 @@ def compare_villages(rec_a, rec_b):
     df = pd.DataFrame(rows, columns=["Parameter", str(rec_a['KGISVill_2']), str(rec_b['KGISVill_2']), "Diff (A − B)"])
     return df, score_a, score_b
 
+# ── Ranking queries: "highest SOC villages in Belagavi", "lowest pH", etc ──
+PARAM_KEYWORDS = [
+    # order matters: more specific phrases first
+    (["organic carbon", "soc"], "SOC"),
+    (["ph", "acidity", "acidic", "alkaline"], "PH"),
+    (["depth"], "DEPTH"),
+    (["texture"], "TEXTURE"),
+    (["fertility", "fertile"], "FERTILITY"),
+]
+
+HIGH_WORDS = ["highest", "high ", "most", "top", "maximum", "max "]
+LOW_WORDS  = ["lowest", "low ", "least", "minimum", "min "]
+
+PARAM_LABELS = {
+    "SOC": "SOC (%)", "PH": "pH", "DEPTH": "Depth (cm)",
+    "TEXTURE": "Texture (bulk density)", "FERTILITY": "Fertility score",
+}
+
+# Physically plausible ranges — anything outside these is a sentinel/garbage
+# value (e.g. -9999 for "no data") from the source shapefile/CSV, not a real
+# reading. Filtered out before any average or ranking is computed.
+PARAM_VALID_RANGES = {
+    "SOC": (0.0, 20.0),      # % organic carbon
+    "PH": (2.0, 12.0),
+    "DEPTH": (0.0, 300.0),   # cm
+    "TEXTURE": (1.0, 2.2),   # g/cm3 bulk density — see TEXTURE_BANDS above
+}
+
+def filter_valid_range(df, param_col):
+    """Drop rows where param_col falls outside a physically plausible range.
+    Guards against sentinel/placeholder values (e.g. -9999) in the source
+    data that aren't NaN but aren't real readings either."""
+    if param_col not in PARAM_VALID_RANGES:
+        return df
+    lo, hi = PARAM_VALID_RANGES[param_col]
+    return df[(df[param_col] >= lo) & (df[param_col] <= hi)]
+
+def detect_ranking_query(q):
+    """Returns (param_col, order, district_filter, subdist_filter) if q is a
+    ranking-style query like 'areas with high SOC' or 'lowest pH villages in
+    Mysuru', else None.
+
+    If the query doesn't name a district/sub-district explicitly, falls back
+    to whatever scope is currently selected via the dropdown/map picker
+    (st.session_state['current_district'] / ['current_subdist'])."""
+    ql = q.lower()
+
+    order = None
+    if any(w in ql for w in HIGH_WORDS):
+        order = "high"
+    elif any(w in ql for w in LOW_WORDS):
+        order = "low"
+    if order is None:
+        return None
+
+    param_col = None
+    for keywords, col in PARAM_KEYWORDS:
+        if any(k in ql for k in keywords):
+            param_col = col
+            break
+    if param_col is None:
+        return None
+
+    district_filter = None
+    for d in village_df["DISTRICT"].dropna().astype(str).unique():
+        if d.lower() in ql:
+            district_filter = d
+            break
+
+    subdist_filter = None
+    sub_scope = village_df
+    if district_filter:
+        sub_scope = village_df[village_df["DISTRICT"].astype(str) == district_filter]
+    for s in sub_scope["SUB_DIST"].dropna().astype(str).unique():
+        if s.lower() in ql:
+            subdist_filter = s
+            break
+
+    # No explicit place named in the query — fall back to whatever's
+    # currently selected via the dropdown/map picker.
+    if district_filter is None and subdist_filter is None:
+        district_filter = st.session_state.get("current_district")
+        subdist_filter = st.session_state.get("current_subdist")
+
+    return param_col, order, district_filter, subdist_filter
+
+def rank_villages(param_col, order="high", district_filter=None, subdist_filter=None, n=10):
+    df = village_df.copy()
+    if district_filter:
+        df = df[df["DISTRICT"].astype(str) == district_filter]
+    if subdist_filter:
+        df = df[df["SUB_DIST"].astype(str) == subdist_filter]
+
+    if param_col == "FERTILITY":
+        for col in ["SOC", "DEPTH", "TEXTURE", "PH"]:
+            df = filter_valid_range(df.dropna(subset=[col]), col)
+        if df.empty:
+            return df
+        df = df.copy()
+        df["FERTILITY"] = df.apply(fertility_score, axis=1)
+        sort_col = "FERTILITY"
+    else:
+        df = filter_valid_range(df[df[param_col].notna()], param_col)
+        sort_col = param_col
+
+    ascending = (order == "low")
+    return df.sort_values(sort_col, ascending=ascending).head(n)
+
+def _scope_label(district_filter, subdist_filter):
+    if subdist_filter and district_filter:
+        return f"{subdist_filter}, {district_filter}"
+    elif district_filter:
+        return district_filter
+    else:
+        return "Karnataka"
+
+def format_ranking_answer(param_col, order, district_filter, subdist_filter, df_result):
+    scope = _scope_label(district_filter, subdist_filter)
+    direction = "Highest" if order == "high" else "Lowest"
+    label = PARAM_LABELS.get(param_col, param_col)
+    lines = [f"**{direction} {label} — {scope}**\n"]
+    for _, row in df_result.iterrows():
+        if param_col == "TEXTURE":
+            val_str = texture_soil_type(row["TEXTURE"])
+        elif param_col == "DEPTH":
+            val_str = f"{round(float(row['DEPTH']))} cm"
+        elif param_col == "FERTILITY":
+            rating = ["Poor", "Low", "Moderate", "Good", "Excellent"][int(row["FERTILITY"])]
+            val_str = f"{rating} ({int(row['FERTILITY'])}/4)"
+        else:
+            val_str = f"{float(row[param_col]):.2f}"
+        lines.append(f"- {row['KGISVill_2']} ({row['SUB_DIST']}, {row['DISTRICT']}): {val_str}")
+    return "\n".join(lines)
+
+def generate_ranking_pdf(df_result, param_col, order, district_filter, subdist_filter=None):
+    """PDF export of a ranking result table (top N villages by a parameter)."""
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4, topMargin=2*cm, bottomMargin=2*cm,
+                            leftMargin=2*cm, rightMargin=2*cm)
+    styles = getSampleStyleSheet()
+    title_style   = ParagraphStyle('title',   parent=styles['Title'],   fontSize=18, textColor=colors.HexColor('#1a4d1a'), spaceAfter=6)
+    heading_style = ParagraphStyle('heading', parent=styles['Heading2'], fontSize=13, textColor=colors.HexColor('#2e7d32'), spaceAfter=4)
+
+    scope = _scope_label(district_filter, subdist_filter)
+    direction = "Highest" if order == "high" else "Lowest"
+    label = PARAM_LABELS.get(param_col, param_col)
+
+    story = [
+        Paragraph("Karnataka Soil Report — Ranking", title_style),
+        Paragraph(f"{direction} {label} — {scope}", heading_style),
+        Spacer(1, 0.3*cm),
+    ]
+
+    rows = [["Village", "Sub-district", "District", label]]
+    for _, row in df_result.iterrows():
+        if param_col == "TEXTURE":
+            val_str = texture_soil_type(row["TEXTURE"])
+        elif param_col == "DEPTH":
+            val_str = f"{round(float(row['DEPTH']))}"
+        elif param_col == "FERTILITY":
+            val_str = ["Poor", "Low", "Moderate", "Good", "Excellent"][int(row["FERTILITY"])]
+        else:
+            val_str = f"{float(row[param_col]):.2f}"
+        rows.append([row["KGISVill_2"], row["SUB_DIST"], row["DISTRICT"], val_str])
+
+    table = Table(rows, colWidths=[4.5*cm, 4*cm, 4*cm, 4*cm])
+    table.setStyle(TableStyle([
+        ('BACKGROUND', (0,0),(-1,0), colors.HexColor('#2e7d32')),
+        ('TEXTCOLOR',  (0,0),(-1,0), colors.white),
+        ('FONTNAME',   (0,0),(-1,0), 'Helvetica-Bold'),
+        ('FONTSIZE',   (0,0),(-1,-1), 9),
+        ('ROWBACKGROUNDS', (0,1),(-1,-1), [colors.white, colors.HexColor('#f5f7f0')]),
+        ('GRID',       (0,0),(-1,-1), 0.5, colors.HexColor('#c8e6c9')),
+        ('PADDING',    (0,0),(-1,-1), 6),
+        ('TEXTCOLOR',  (0,1),(-1,-1), colors.HexColor('#1a3a1a')),
+    ]))
+    story.append(table)
+    doc.build(story)
+    buffer.seek(0)
+    return buffer
+
+def ranking_result_to_csv_bytes(df_result, param_col):
+    cols = ["KGISVill_2", "SUB_DIST", "DISTRICT"]
+    if param_col == "FERTILITY":
+        cols.append("FERTILITY")
+    else:
+        cols.append(param_col)
+    return df_result[cols].to_csv(index=False).encode("utf-8")
+
+# ── Nearest-value queries: "SOC nearest to 6.2", "pH close to 7 in Mysuru" ──
+def detect_nearest_query(q):
+    """Returns (param_col, target_value, district_filter) for queries like
+    'SOC nearest to 6.2', 'villages with pH close to 7 in Mysuru',
+    'depth around 50', else None."""
+    ql = q.lower()
+
+    trigger_words = ["nearest to", "closest to", "close to", "near ", "around ", "approx"]
+    if not any(w in ql for w in trigger_words):
+        return None
+
+    param_col = None
+    for keywords, col in PARAM_KEYWORDS:
+        if col == "FERTILITY":
+            continue  # fertility is a 0-4 score, not a value to target
+        if any(k in ql for k in keywords):
+            param_col = col
+            break
+    if param_col is None:
+        return None
+
+    import re
+    match = re.search(r'(\d+\.?\d*)', ql)
+    if not match:
+        return None
+    target_value = float(match.group(1))
+
+    district_filter = None
+    for d in village_df["DISTRICT"].dropna().astype(str).unique():
+        if d.lower() in ql:
+            district_filter = d
+            break
+
+    return param_col, target_value, district_filter
+
+def rank_villages_nearest(param_col, target_value, district_filter=None, n=10):
+    df = village_df.copy()
+    if district_filter:
+        df = df[df["DISTRICT"].astype(str) == district_filter]
+
+    df = filter_valid_range(df[df[param_col].notna()], param_col)
+    if df.empty:
+        return df
+
+    df = df.copy()
+    df["_diff"] = (df[param_col].astype(float) - target_value).abs()
+    return df.sort_values("_diff").head(n)
+
+def format_nearest_answer(param_col, target_value, district_filter, df_result):
+    scope = district_filter if district_filter else "Karnataka"
+    label = PARAM_LABELS.get(param_col, param_col)
+    lines = [f"**{label} closest to {target_value:g} — {scope}**\n"]
+    for _, row in df_result.iterrows():
+        if param_col == "TEXTURE":
+            val_str = texture_soil_type(row["TEXTURE"])
+        elif param_col == "DEPTH":
+            val_str = f"{round(float(row['DEPTH']))} cm"
+        else:
+            val_str = f"{float(row[param_col]):.2f}"
+        lines.append(f"- {row['KGISVill_2']} ({row['SUB_DIST']}, {row['DISTRICT']}): {val_str} (Δ {row['_diff']:.2f})")
+    return "\n".join(lines)
+
+def nearest_result_to_csv_bytes(df_result, param_col):
+    cols = ["KGISVill_2", "SUB_DIST", "DISTRICT", param_col, "_diff"]
+    return df_result[cols].rename(columns={"_diff": "Diff_from_target"}).to_csv(index=False).encode("utf-8")
+
+def generate_nearest_pdf(df_result, param_col, target_value, district_filter):
+    """PDF export of a nearest-value result table (N villages closest to a target)."""
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4, topMargin=2*cm, bottomMargin=2*cm,
+                            leftMargin=2*cm, rightMargin=2*cm)
+    styles = getSampleStyleSheet()
+    title_style   = ParagraphStyle('title',   parent=styles['Title'],   fontSize=18, textColor=colors.HexColor('#1a4d1a'), spaceAfter=6)
+    heading_style = ParagraphStyle('heading', parent=styles['Heading2'], fontSize=13, textColor=colors.HexColor('#2e7d32'), spaceAfter=4)
+
+    scope = district_filter if district_filter else "Karnataka"
+    label = PARAM_LABELS.get(param_col, param_col)
+
+    story = [
+        Paragraph("Karnataka Soil Report — Nearest Value", title_style),
+        Paragraph(f"{label} closest to {target_value:g} — {scope}", heading_style),
+        Spacer(1, 0.3*cm),
+    ]
+
+    rows = [["Village", "Sub-district", "District", label, "Δ from target"]]
+    for _, row in df_result.iterrows():
+        if param_col == "TEXTURE":
+            val_str = texture_soil_type(row["TEXTURE"])
+        elif param_col == "DEPTH":
+            val_str = f"{round(float(row['DEPTH']))}"
+        else:
+            val_str = f"{float(row[param_col]):.2f}"
+        rows.append([row["KGISVill_2"], row["SUB_DIST"], row["DISTRICT"], val_str, f"{row['_diff']:.2f}"])
+
+    table = Table(rows, colWidths=[4*cm, 3.5*cm, 3.5*cm, 3*cm, 3*cm])
+    table.setStyle(TableStyle([
+        ('BACKGROUND', (0,0),(-1,0), colors.HexColor('#2e7d32')),
+        ('TEXTCOLOR',  (0,0),(-1,0), colors.white),
+        ('FONTNAME',   (0,0),(-1,0), 'Helvetica-Bold'),
+        ('FONTSIZE',   (0,0),(-1,-1), 9),
+        ('ROWBACKGROUNDS', (0,1),(-1,-1), [colors.white, colors.HexColor('#f5f7f0')]),
+        ('GRID',       (0,0),(-1,-1), 0.5, colors.HexColor('#c8e6c9')),
+        ('PADDING',    (0,0),(-1,-1), 6),
+        ('TEXTCOLOR',  (0,1),(-1,-1), colors.HexColor('#1a3a1a')),
+    ]))
+    story.append(table)
+    doc.build(story)
+    buffer.seek(0)
+    return buffer
+
+# ── Range queries: "pH between 6 and 7", "SOC 0.5 to 0.75 in Mysuru" ──────
+def detect_range_query(q):
+    """Returns (param_col, lo, hi, district_filter, subdist_filter) for queries
+    like 'pH between 6 and 7', 'SOC from 0.5 to 0.75 in Mysuru',
+    'depth 40-60 in Belagavi', else None.
+
+    Falls back to the currently selected dropdown/map scope when no place is
+    named, same as detect_ranking_query / detect_nearest_query."""
+    ql = q.lower()
+
+    if not any(w in ql for w in ["between", " to ", "-", " and "]):
+        return None
+
+    param_col = None
+    for keywords, col in PARAM_KEYWORDS:
+        if col == "FERTILITY":
+            continue  # range doesn't make sense for a 0-4 score
+        if any(k in ql for k in keywords):
+            param_col = col
+            break
+    if param_col is None:
+        return None
+
+    import re
+    # matches "between 6 and 7", "6 to 7", "6-7", "6 and 7"
+    match = re.search(
+        r'(\d+\.?\d*)\s*(?:-|to|and)\s*(\d+\.?\d*)', ql
+    )
+    if not match:
+        return None
+
+    v1, v2 = float(match.group(1)), float(match.group(2))
+    lo, hi = min(v1, v2), max(v1, v2)
+    if lo == hi:
+        return None  # not actually a range, let detect_nearest_query handle it
+
+    district_filter = None
+    for d in village_df["DISTRICT"].dropna().astype(str).unique():
+        if d.lower() in ql:
+            district_filter = d
+            break
+
+    subdist_filter = None
+    sub_scope = village_df
+    if district_filter:
+        sub_scope = village_df[village_df["DISTRICT"].astype(str) == district_filter]
+    for s in sub_scope["SUB_DIST"].dropna().astype(str).unique():
+        if s.lower() in ql:
+            subdist_filter = s
+            break
+
+    if district_filter is None and subdist_filter is None:
+        district_filter = st.session_state.get("current_district")
+        subdist_filter = st.session_state.get("current_subdist")
+
+    return param_col, lo, hi, district_filter, subdist_filter
+
+def rank_villages_range(param_col, lo, hi, district_filter=None, subdist_filter=None, n=50):
+    df = village_df.copy()
+    if district_filter:
+        df = df[df["DISTRICT"].astype(str) == district_filter]
+    if subdist_filter:
+        df = df[df["SUB_DIST"].astype(str) == subdist_filter]
+
+    df = filter_valid_range(df[df[param_col].notna()], param_col)
+    if df.empty:
+        return df
+
+    mask = (df[param_col].astype(float) >= lo) & (df[param_col].astype(float) <= hi)
+    return df[mask].sort_values(param_col).head(n)
+
+def format_range_answer(param_col, lo, hi, district_filter, subdist_filter, df_result):
+    scope = _scope_label(district_filter, subdist_filter)
+    label = PARAM_LABELS.get(param_col, param_col)
+    lines = [f"**{label} between {lo:g} and {hi:g} — {scope}** ({len(df_result)} matches)\n"]
+    for _, row in df_result.head(20).iterrows():
+        if param_col == "TEXTURE":
+            val_str = texture_soil_type(row["TEXTURE"])
+        elif param_col == "DEPTH":
+            val_str = f"{round(float(row['DEPTH']))} cm"
+        else:
+            val_str = f"{float(row[param_col]):.2f}"
+        lines.append(f"- {row['KGISVill_2']} ({row['SUB_DIST']}, {row['DISTRICT']}): {val_str}")
+    if len(df_result) > 20:
+        lines.append(f"\n_...and {len(df_result) - 20} more. Download CSV/PDF for the full list._")
+    return "\n".join(lines)
+
+def range_result_to_csv_bytes(df_result, param_col):
+    cols = ["KGISVill_2", "SUB_DIST", "DISTRICT", param_col]
+    return df_result[cols].to_csv(index=False).encode("utf-8")
+
+def generate_range_pdf(df_result, param_col, lo, hi, district_filter, subdist_filter=None):
+    """PDF export of a range-query result table (villages within [lo, hi])."""
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4, topMargin=2*cm, bottomMargin=2*cm,
+                            leftMargin=2*cm, rightMargin=2*cm)
+    styles = getSampleStyleSheet()
+    title_style   = ParagraphStyle('title',   parent=styles['Title'],   fontSize=18, textColor=colors.HexColor('#1a4d1a'), spaceAfter=6)
+    heading_style = ParagraphStyle('heading', parent=styles['Heading2'], fontSize=13, textColor=colors.HexColor('#2e7d32'), spaceAfter=4)
+
+    scope = _scope_label(district_filter, subdist_filter)
+    label = PARAM_LABELS.get(param_col, param_col)
+
+    story = [
+        Paragraph("Karnataka Soil Report — Range Query", title_style),
+        Paragraph(f"{label} between {lo:g} and {hi:g} — {scope}", heading_style),
+        Spacer(1, 0.3*cm),
+    ]
+
+    rows = [["Village", "Sub-district", "District", label]]
+    for _, row in df_result.iterrows():
+        if param_col == "TEXTURE":
+            val_str = texture_soil_type(row["TEXTURE"])
+        elif param_col == "DEPTH":
+            val_str = f"{round(float(row['DEPTH']))}"
+        else:
+            val_str = f"{float(row[param_col]):.2f}"
+        rows.append([row["KGISVill_2"], row["SUB_DIST"], row["DISTRICT"], val_str])
+
+    table = Table(rows, colWidths=[4.5*cm, 4*cm, 4*cm, 4*cm])
+    table.setStyle(TableStyle([
+        ('BACKGROUND', (0,0),(-1,0), colors.HexColor('#2e7d32')),
+        ('TEXTCOLOR',  (0,0),(-1,0), colors.white),
+        ('FONTNAME',   (0,0),(-1,0), 'Helvetica-Bold'),
+        ('FONTSIZE',   (0,0),(-1,-1), 9),
+        ('ROWBACKGROUNDS', (0,1),(-1,-1), [colors.white, colors.HexColor('#f5f7f0')]),
+        ('GRID',       (0,0),(-1,-1), 0.5, colors.HexColor('#c8e6c9')),
+        ('PADDING',    (0,0),(-1,-1), 6),
+        ('TEXTCOLOR',  (0,1),(-1,-1), colors.HexColor('#1a3a1a')),
+    ]))
+    story.append(table)
+    doc.build(story)
+    buffer.seek(0)
+    return buffer
+
+# ── Compare-intent parsing for chat ("compare X and Y", "X vs Y") ──
+def detect_compare_query(q):
+    """Returns (village_name_a, village_name_b) if q looks like a compare
+    request and both names can be matched against known villages, else None."""
+    ql = q.lower()
+    if not any(w in ql for w in ["compare", " vs ", " vs.", "versus"]):
+        return None
+
+    import re
+    q_clean = re.sub(r'^.*?compare\s+', '', ql) if "compare" in ql else ql
+    q_clean = re.sub(r'\bsoil\b|\bfertility\b|\bdata\b', '', q_clean)
+    parts = re.split(r'\s+(?:vs\.?|versus|and)\s+|,', q_clean)
+    parts = [p.strip() for p in parts if p.strip()]
+    if len(parts) < 2:
+        return None
+
+    all_villages = village_df["KGISVill_2"].dropna().astype(str).unique()
+    matched = []
+    for part in parts[:2]:
+        hit = next((v for v in all_villages if part == v.lower()), None)
+        if hit is None:
+            hit = next((v for v in all_villages if part in v.lower() or v.lower() in part), None)
+        if hit:
+            matched.append(hit)
+
+    if len(matched) < 2 or matched[0] == matched[1]:
+        return None
+    return matched[0], matched[1]
+
 # ── PDF report ─────────────────────────────────────────────────
 def generate_pdf_report(record, village_name=None):
     buffer = io.BytesIO()
@@ -393,27 +871,40 @@ def color_for_name(name):
     return DISTRICT_PALETTE[h % len(DISTRICT_PALETTE)]
 
 def add_boundary_layer(m, geojson_data, name_key, fill_color="#4caf50",
-                        border_color="#1a4d1a", color_by_feature=False):
+                        border_color="#1a4d1a", color_by_feature=False,
+                        value_color_map=None, value_labels=None, default_color="#cccccc"):
+    """value_color_map: optional {name: hex_color} to color features by a
+    continuous value (choropleth) instead of a categorical hash.
+    value_labels: optional {name: "display value string"} shown in the tooltip."""
     # Fill in missing/blank names so the tooltip never renders as an empty pill
     for feature in geojson_data.get("features", []):
         props = feature.get("properties", {})
         val = props.get(name_key)
         if val is None or str(val).strip() == "":
             props[name_key] = "Unknown"
+        if value_labels is not None:
+            props["_value_label"] = value_labels.get(props[name_key], "No data")
 
     def style_fn(f):
+        name = f["properties"].get(name_key, "")
+        if value_color_map is not None:
+            c = value_color_map.get(name, default_color)
+            return {"fillColor": c, "color": "#333333", "weight": 1.2, "fillOpacity": 0.65}
         if color_by_feature:
-            c = color_for_name(f["properties"].get(name_key, ""))
+            c = color_for_name(name)
             return {"fillColor": c, "color": "#333333", "weight": 1.2, "fillOpacity": 0.45}
         return {"fillColor": fill_color, "color": border_color, "weight": 1.5, "fillOpacity": 0.25}
+
+    tooltip_fields = [name_key] + (["_value_label"] if value_labels is not None else [])
+    tooltip_labels = value_labels is not None  # show field name only when there are 2 fields
 
     folium.GeoJson(
         geojson_data,
         style_function=style_fn,
         highlight_function=lambda f: {"fillColor": "#ffb300", "color": "#e65100", "weight": 2.5, "fillOpacity": 0.55},
         tooltip=folium.GeoJsonTooltip(
-            fields=[name_key],
-            labels=False,      # show only the value, no field name prefix
+            fields=tooltip_fields,
+            labels=tooltip_labels,
             sticky=True,       # tooltip follows the cursor and appears reliably on hover
             style="""
                 background-color: #ffffff !important;
@@ -428,6 +919,62 @@ def add_boundary_layer(m, geojson_data, name_key, fill_color="#4caf50",
         ),
     ).add_to(m)
 
+def compute_texture_choropleth(df_source, group_col):
+    """Dominant soil-type category per group_col value (by count, not average
+    bulk density — texture is categorical, not a continuous high/low scale).
+    Returns {name: hex_color}, {name: soil_type_label}, (None, None)."""
+    df = filter_valid_range(df_source.dropna(subset=["TEXTURE"]), "TEXTURE")
+    if df.empty:
+        return {}, {}, (None, None)
+
+    df = df.copy()
+    df["_soil_type"] = df["TEXTURE"].apply(texture_soil_type)
+    dominant = df.groupby(group_col)["_soil_type"].agg(lambda s: s.value_counts().idxmax())
+
+    color_map = {name: TEXTURE_TYPE_COLORS.get(t, "#cccccc") for name, t in dominant.items()}
+    label_map = {name: t for name, t in dominant.items()}
+    return color_map, label_map, (None, None)
+
+def compute_choropleth(df_source, group_col, param_col, cmap_name="RdYlGn_r"):
+    """Average param_col per group_col value → {name: hex_color}, {name: label}, (vmin, vmax).
+    TEXTURE is categorical, so it's routed to compute_texture_choropleth instead."""
+    if param_col == "TEXTURE":
+        return compute_texture_choropleth(df_source, group_col)
+
+    df = filter_valid_range(df_source.dropna(subset=[param_col]), param_col)
+    avg = df.groupby(group_col)[param_col].mean()
+    if avg.empty:
+        return {}, {}, (None, None)
+
+    vmin, vmax = float(avg.min()), float(avg.max())
+    norm = mcolors.Normalize(vmin=vmin, vmax=vmax) if vmax > vmin else mcolors.Normalize(vmin=vmin - 1, vmax=vmax + 1)
+    cmap = mpl.colormaps[cmap_name]
+
+    color_map, label_map = {}, {}
+    for name, value in avg.items():
+        color_map[name] = mcolors.rgb2hex(cmap(norm(value)))
+        label_map[name] = f"{value:.2f}"
+    return color_map, label_map, (vmin, vmax)
+
+def render_choropleth_legend(param_col, metric_display_name, label_map, vmin, vmax, group_word):
+    """Shows a numeric gradient caption for continuous params, or a colored
+    swatch legend of soil-type categories present when param_col is TEXTURE."""
+    if param_col == "TEXTURE":
+        if not label_map:
+            return
+        types_present = sorted(set(label_map.values()), key=lambda t: [b[1] for b in TEXTURE_BANDS].index(t) if t in [b[1] for b in TEXTURE_BANDS] else 99)
+        swatches = " &nbsp; ".join(
+            f'<span style="display:inline-block;width:12px;height:12px;background:{TEXTURE_TYPE_COLORS.get(t, "#ccc")};'
+            f'border-radius:2px;margin-right:4px;vertical-align:middle;"></span>{t}'
+            for t in types_present
+        )
+        st.markdown(f"🎨 Dominant soil type per {group_word}: {swatches}", unsafe_allow_html=True)
+    elif vmin is not None:
+        st.caption(f"🎨 Colour scale (green → red): {vmin:.2f} → {vmax:.2f} average {metric_display_name} per {group_word}")
+
+CHOROPLETH_METRIC_OPTIONS = ["Default (by name)", "SOC (avg)", "pH (avg)", "Depth (avg)", "Texture (soil type)"]
+CHOROPLETH_METRIC_COL_MAP = {"SOC (avg)": "SOC", "pH (avg)": "PH", "Depth (avg)": "DEPTH", "Texture (soil type)": "TEXTURE"}
+
 def init_map_state():
     defaults = {
         "map_level": "district",
@@ -440,12 +987,20 @@ def init_map_state():
         if key not in st.session_state:
             st.session_state[key] = default
 
+def set_current_scope(district=None, subdist=None):
+    """Tracks the district/sub-district currently selected via the
+    dropdown or map picker, so chat ranking queries that don't name a
+    place explicitly can fall back to this scope."""
+    st.session_state["current_district"] = district
+    st.session_state["current_subdist"] = subdist
+
 def reset_map_selection():
     st.session_state.map_level = "district"
     st.session_state.sel_district = None
     st.session_state.sel_subdist = None
     st.session_state.sel_village = None
     st.session_state.zoom_bounds = None
+    set_current_scope(None, None)
 
 # ══════════════════════════════════════════════════════════════
 # UI
@@ -477,7 +1032,7 @@ section[data-testid="stSidebar"] label { color: #d4edda !important; }
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown("<h1>🌱 Karnataka Soil Chatbot</h1>", unsafe_allow_html=True)
+st.markdown("<h1>🌱 SoilMitra AI – South Indian Soil Intelligence and Advisory System</h1>", unsafe_allow_html=True)
 
 search_mode = st.radio(
     "Search by",
@@ -499,6 +1054,7 @@ if search_mode == "District / Sub-district / Village (dropdown)":
     selected_village = st.selectbox("Village", sorted(vill_df["KGISVill_2"].dropna().astype(str).unique()))
     record = vill_df[vill_df["KGISVill_2"].astype(str) == selected_village].iloc[0]
     location_label = str(record["KGISVill_2"])
+    set_current_scope(selected_district, selected_subdist)
 
 # ── Mode 2: Map-based drill-down picker (boundary polygons) ─────
 elif search_mode == "Map (click to select)":
@@ -516,18 +1072,34 @@ elif search_mode == "Map (click to select)":
         st.session_state.sel_subdist = None
         st.session_state.sel_village = None
         st.session_state.zoom_bounds = None
+        set_current_scope(None, None)
         st.rerun()
     if st.session_state.sel_subdist and b3.button(f"◀ {st.session_state.sel_subdist}", key="btn_back_subdist"):
         st.session_state.map_level = "subdistrict"
         st.session_state.sel_subdist = None
         st.session_state.sel_village = None
+        set_current_scope(st.session_state.sel_district, None)
         st.rerun()
 
     # ---- LEVEL 1: districts ----
     if st.session_state.map_level == "district":
         district_gdf = get_district_boundaries()
+
+        color_metric = st.selectbox(
+            "Color districts by", CHOROPLETH_METRIC_OPTIONS, key="district_color_metric",
+        )
+
         m = folium.Map(location=[15.3, 75.7], zoom_start=7, tiles="CartoDB positron")
-        add_boundary_layer(m, gdf_to_geojson(district_gdf), "DISTRICT", color_by_feature=True)
+
+        if color_metric in CHOROPLETH_METRIC_COL_MAP:
+            param_col = CHOROPLETH_METRIC_COL_MAP[color_metric]
+            color_map, label_map, (vmin, vmax) = compute_choropleth(village_df, "DISTRICT", param_col)
+            add_boundary_layer(m, gdf_to_geojson(district_gdf), "DISTRICT",
+                                value_color_map=color_map, value_labels=label_map)
+            render_choropleth_legend(param_col, color_metric.split(' ')[0], label_map, vmin, vmax, "district")
+        else:
+            add_boundary_layer(m, gdf_to_geojson(district_gdf), "DISTRICT", color_by_feature=True)
+
         map_data = st_folium(m, height=520, width=None, key="district_map")
         clicked = map_data.get("last_active_drawing")
         if clicked:
@@ -539,6 +1111,7 @@ elif search_mode == "Map (click to select)":
                 st.session_state.sel_village = None
                 st.session_state.map_level = "subdistrict"
                 st.session_state.zoom_bounds = feature_bounds_from_geom(row.geometry)
+                set_current_scope(name, None)
                 st.rerun()
 
     # ---- LEVEL 2: sub-districts ----
@@ -547,9 +1120,24 @@ elif search_mode == "Map (click to select)":
         if taluk_gdf.empty:
             st.error(f"No boundary data found for district '{st.session_state.sel_district}'. Click Reset.")
         else:
+            color_metric = st.selectbox(
+                "Color sub-districts by", CHOROPLETH_METRIC_OPTIONS, key="subdist_color_metric",
+            )
+
             m = folium.Map(tiles="CartoDB positron")
             m.fit_bounds(st.session_state.zoom_bounds)
-            add_boundary_layer(m, gdf_to_geojson(taluk_gdf), "SUB_DIST", fill_color="#4caf50", border_color="#1a4d1a")
+
+            district_villages = village_df[village_df["DISTRICT"].astype(str) == st.session_state.sel_district]
+
+            if color_metric in CHOROPLETH_METRIC_COL_MAP:
+                param_col = CHOROPLETH_METRIC_COL_MAP[color_metric]
+                color_map, label_map, (vmin, vmax) = compute_choropleth(district_villages, "SUB_DIST", param_col)
+                add_boundary_layer(m, gdf_to_geojson(taluk_gdf), "SUB_DIST",
+                                    value_color_map=color_map, value_labels=label_map)
+                render_choropleth_legend(param_col, color_metric.split(' ')[0], label_map, vmin, vmax, "sub-district")
+            else:
+                add_boundary_layer(m, gdf_to_geojson(taluk_gdf), "SUB_DIST", fill_color="#4caf50", border_color="#1a4d1a")
+
             map_data = st_folium(m, height=520, width=None, key="subdist_map")
             clicked = map_data.get("last_active_drawing")
             if clicked:
@@ -560,6 +1148,7 @@ elif search_mode == "Map (click to select)":
                     st.session_state.sel_village = None
                     st.session_state.map_level = "village"
                     st.session_state.zoom_bounds = feature_bounds_from_geom(row.geometry)
+                    set_current_scope(st.session_state.sel_district, name)
                     st.rerun()
 
     # ---- LEVEL 3: villages ----
@@ -574,9 +1163,27 @@ elif search_mode == "Map (click to select)":
                 f"'{st.session_state.sel_district}'. Click Reset and try again."
             )
         else:
+            color_metric = st.selectbox(
+                "Color villages by", CHOROPLETH_METRIC_OPTIONS, key="village_color_metric",
+            )
+
             m = folium.Map(tiles="CartoDB positron")
             m.fit_bounds(st.session_state.zoom_bounds)
-            add_boundary_layer(m, gdf_to_geojson(vill_gdf), "KGISVill_2", fill_color="#ff9800", border_color="#e65100")
+
+            subdist_villages = village_df[
+                (village_df["DISTRICT"].astype(str) == st.session_state.sel_district) &
+                (village_df["SUB_DIST"].astype(str) == st.session_state.sel_subdist)
+            ]
+
+            if color_metric in CHOROPLETH_METRIC_COL_MAP:
+                param_col = CHOROPLETH_METRIC_COL_MAP[color_metric]
+                color_map, label_map, (vmin, vmax) = compute_choropleth(subdist_villages, "KGISVill_2", param_col)
+                add_boundary_layer(m, gdf_to_geojson(vill_gdf), "KGISVill_2",
+                                    value_color_map=color_map, value_labels=label_map)
+                render_choropleth_legend(param_col, color_metric.split(' ')[0], label_map, vmin, vmax, "village")
+            else:
+                add_boundary_layer(m, gdf_to_geojson(vill_gdf), "KGISVill_2", fill_color="#ff9800", border_color="#e65100")
+
             map_data = st_folium(m, height=520, width=None, key="village_map")
             clicked = map_data.get("last_active_drawing")
             if clicked:
@@ -676,10 +1283,9 @@ else:
 st.markdown("---")
 
 if record is None:
-    st.info("Select a valid location to view soil data.")
-    st.stop()
+    st.info("Select a valid location to view soil data — or use the chat box below to ask a state/district-wide question like 'highest SOC villages in Belagavi', 'pH between 6 and 7', or 'SOC nearest to 6.2'.")
 
-if search_mode == "Latitude & Longitude":
+if search_mode == "Latitude & Longitude" and record is not None:
     st.markdown("#### 📊 IDW-estimated soil data at entered coordinates")
     st.caption("Estimated from the 4 nearest known sample points, weighted by distance.")
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -704,7 +1310,7 @@ if search_mode == "Latitude & Longitude":
     })
     st.map(map_df)
 
-else:
+elif record is not None:
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Village",    record["KGISVill_2"])
     c2.metric("District",   record["DISTRICT"])
@@ -717,55 +1323,56 @@ else:
 # ══════════════════════════════════════════════════════════════
 # Weather
 # ══════════════════════════════════════════════════════════════
-st.markdown("---")
-st.markdown("#### 🌦️ Weather Forecast")
+if record is not None:
+    st.markdown("---")
+    st.markdown("#### 🌦️ Weather Forecast")
 
-if search_mode == "Latitude & Longitude":
-    weather_lat, weather_lon = input_lat, input_lon
-else:
-    weather_lat, weather_lon = float(record["latitude"]), float(record["longitude"])
+    if search_mode == "Latitude & Longitude":
+        weather_lat, weather_lon = input_lat, input_lon
+    else:
+        weather_lat, weather_lon = float(record["latitude"]), float(record["longitude"])
 
-weather_data = fetch_weather(weather_lat, weather_lon)
+    weather_data = fetch_weather(weather_lat, weather_lon)
 
-if weather_data:
-    current = weather_data.get("current", {})
-    daily = weather_data.get("daily", {})
+    if weather_data:
+        current = weather_data.get("current", {})
+        daily = weather_data.get("daily", {})
 
-    w1, w2, w3 = st.columns(3)
-    w1.metric("Temperature", f"{current.get('temperature_2m', 'N/A')} °C")
-    w2.metric("Humidity", f"{current.get('relative_humidity_2m', 'N/A')}%")
-    w3.metric("Current Rain", f"{current.get('precipitation', 'N/A')} mm")
+        w1, w2, w3 = st.columns(3)
+        w1.metric("Temperature", f"{current.get('temperature_2m', 'N/A')} °C")
+        w2.metric("Humidity", f"{current.get('relative_humidity_2m', 'N/A')}%")
+        w3.metric("Current Rain", f"{current.get('precipitation', 'N/A')} mm")
 
-    precip_sum = daily.get("precipitation_sum", [])
-    if precip_sum:
-        st.info(f"🌧️ {rainfall_advice(precip_sum)}")
+        precip_sum = daily.get("precipitation_sum", [])
+        if precip_sum:
+            st.info(f"🌧️ {rainfall_advice(precip_sum)}")
 
-    temp_max = daily.get("temperature_2m_max", [])
-    temp_min = daily.get("temperature_2m_min", [])
-    dates = daily.get("time", [])
-    if dates:
-        forecast_df = pd.DataFrame({
-            "Date": dates,
-            "Max Temp (°C)": temp_max,
-            "Min Temp (°C)": temp_min,
-            "Rain (mm)": precip_sum,
-        })
-        st.dataframe(forecast_df, use_container_width=True, hide_index=True)
-else:
-    st.warning("Weather data unavailable right now.")
+        temp_max = daily.get("temperature_2m_max", [])
+        temp_min = daily.get("temperature_2m_min", [])
+        dates = daily.get("time", [])
+        if dates:
+            forecast_df = pd.DataFrame({
+                "Date": dates,
+                "Max Temp (°C)": temp_max,
+                "Min Temp (°C)": temp_min,
+                "Rain (mm)": precip_sum,
+            })
+            st.dataframe(forecast_df, use_container_width=True, hide_index=True)
+    else:
+        st.warning("Weather data unavailable right now.")
 
-# ══════════════════════════════════════════════════════════════
-# PDF export
-# ══════════════════════════════════════════════════════════════
-st.markdown("---")
-if st.button("📄 Export PDF Report", key="btn_export_pdf"):
-    pdf_buffer = generate_pdf_report(record, village_name=location_label)
-    st.download_button(
-        label="⬇️ Download Report",
-        data=pdf_buffer,
-        file_name=f"soil_report_{location_label.split()[0].replace(',', '')}.pdf",
-        mime="application/pdf"
-    )
+    # ══════════════════════════════════════════════════════════════
+    # PDF export
+    # ══════════════════════════════════════════════════════════════
+    st.markdown("---")
+    if st.button("📄 Export PDF Report", key="btn_export_pdf"):
+        pdf_buffer = generate_pdf_report(record, village_name=location_label)
+        st.download_button(
+            label="⬇️ Download Report",
+            data=pdf_buffer,
+            file_name=f"soil_report_{location_label.split()[0].replace(',', '')}.pdf",
+            mime="application/pdf"
+        )
 
 # ══════════════════════════════════════════════════════════════
 # Voice input
@@ -801,29 +1408,123 @@ if audio:
 # ══════════════════════════════════════════════════════════════
 # Chat
 # ══════════════════════════════════════════════════════════════
-text_query = st.text_input("💬 Ask about this location's soil")
+text_query = st.text_input("💬 Ask about this location's soil, or ask e.g. 'highest SOC villages in Belagavi', 'pH between 6 and 7', or 'SOC nearest to 6.2'")
 query = voice_query if voice_query else text_query
 
-if query and record is not None:
+if query:
     st.chat_message("user").write(query)
-    answer = keyword_response(query, record, location_name=location_label)
 
-    if answer is None:
-        context = f"""Soil expert for Karnataka. Data:
+    compare_names = detect_compare_query(query)
+    ranking = None if compare_names else detect_ranking_query(query)
+    range_q = None if (compare_names or ranking) else detect_range_query(query)
+    nearest = None if (compare_names or ranking or range_q) else detect_nearest_query(query)
+    already_rendered = False
+
+    if compare_names:
+        # "compare X and Y" / "X vs Y" — doesn't need a selected location
+        name_a, name_b = compare_names
+        rec_a = village_df[village_df["KGISVill_2"] == name_a].iloc[0]
+        rec_b = village_df[village_df["KGISVill_2"] == name_b].iloc[0]
+        compare_df, score_a, score_b = compare_villages(rec_a, rec_b)
+
+        st.chat_message("assistant").dataframe(compare_df, use_container_width=True, hide_index=True)
+        if score_a != score_b:
+            winner = name_a if score_a > score_b else name_b
+            answer = f"🏆 {winner} has better overall soil fertility ({max(score_a, score_b)}/4 vs {min(score_a, score_b)}/4)."
+        else:
+            answer = f"{name_a} and {name_b} have equal fertility scores ({score_a}/4)."
+        st.write(answer)
+        already_rendered = True
+
+    elif ranking:
+        # Dataset-wide ranking query — falls back to current map/dropdown
+        # scope when no district/sub-district is named in the query
+        param_col, order, district_filter, subdist_filter = ranking
+        result_df = rank_villages(param_col, order, district_filter, subdist_filter)
+        if result_df.empty:
+            answer = "No matching data found for that query."
+            st.chat_message("assistant").write(answer)
+        else:
+            answer = format_ranking_answer(param_col, order, district_filter, subdist_filter, result_df)
+            st.chat_message("assistant").write(answer)
+
+            dl1, dl2 = st.columns(2)
+            dl1.download_button(
+                "⬇️ Download CSV", data=ranking_result_to_csv_bytes(result_df, param_col),
+                file_name="soil_ranking.csv", mime="text/csv", key="ranking_csv_dl",
+            )
+            dl2.download_button(
+                "⬇️ Download PDF", data=generate_ranking_pdf(result_df, param_col, order, district_filter, subdist_filter),
+                file_name="soil_ranking.pdf", mime="application/pdf", key="ranking_pdf_dl",
+            )
+        already_rendered = True
+
+    elif range_q:
+        # "pH between 6 and 7" / "SOC 0.5 to 0.75 in Mysuru" — falls back to
+        # current map/dropdown scope when no place is named in the query
+        param_col, lo, hi, district_filter, subdist_filter = range_q
+        result_df = rank_villages_range(param_col, lo, hi, district_filter, subdist_filter)
+        if result_df.empty:
+            answer = "No matching data found for that range."
+            st.chat_message("assistant").write(answer)
+        else:
+            answer = format_range_answer(param_col, lo, hi, district_filter, subdist_filter, result_df)
+            st.chat_message("assistant").write(answer)
+
+            dl1, dl2 = st.columns(2)
+            dl1.download_button(
+                "⬇️ Download CSV", data=range_result_to_csv_bytes(result_df, param_col),
+                file_name="soil_range.csv", mime="text/csv", key="range_csv_dl",
+            )
+            dl2.download_button(
+                "⬇️ Download PDF", data=generate_range_pdf(result_df, param_col, lo, hi, district_filter, subdist_filter),
+                file_name="soil_range.pdf", mime="application/pdf", key="range_pdf_dl",
+            )
+        already_rendered = True
+
+    elif nearest:
+        # "SOC nearest to 6.2" / "pH close to 7 in Mysuru" — doesn't need a selected location
+        param_col, target_value, district_filter = nearest
+        result_df = rank_villages_nearest(param_col, target_value, district_filter)
+        if result_df.empty:
+            answer = "No matching data found for that query."
+            st.chat_message("assistant").write(answer)
+        else:
+            answer = format_nearest_answer(param_col, target_value, district_filter, result_df)
+            st.chat_message("assistant").write(answer)
+
+            dl1, dl2 = st.columns(2)
+            dl1.download_button(
+                "⬇️ Download CSV", data=nearest_result_to_csv_bytes(result_df, param_col),
+                file_name="soil_nearest.csv", mime="text/csv", key="nearest_csv_dl",
+            )
+            dl2.download_button(
+                "⬇️ Download PDF", data=generate_nearest_pdf(result_df, param_col, target_value, district_filter),
+                file_name="soil_nearest.pdf", mime="application/pdf", key="nearest_pdf_dl",
+            )
+        already_rendered = True
+
+    elif record is not None:
+        answer = keyword_response(query, record, location_name=location_label)
+        if answer is None:
+            context = f"""Soil expert for Karnataka. Data:
 Location: {location_label}
 SOC: {record.get('SOC', 'N/A')}%, Depth: {record.get('DEPTH', 'N/A')} cm, Texture: {texture_soil_type(record.get('TEXTURE', 0))}, pH: {record.get('PH', 'N/A')}
 Question: {query}. Be concise."""
-        try:
-            res = groq_client.chat.completions.create(
-                model="llama-3.1-8b-instant",
-                messages=[{"role": "user", "content": context}],
-                max_tokens=500
-            )
-            answer = res.choices[0].message.content
-        except Exception as e:
-            answer = f"AI unavailable: {e}"
+            try:
+                res = groq_client.chat.completions.create(
+                    model="llama-3.1-8b-instant",
+                    messages=[{"role": "user", "content": context}],
+                    max_tokens=500
+                )
+                answer = res.choices[0].message.content
+            except Exception as e:
+                answer = f"AI unavailable: {e}"
+    else:
+        answer = "Select a location first, or ask a dataset-wide question like 'areas with high pH in Tumakuru', 'lowest SOC villages', 'pH between 6 and 7', or 'SOC nearest to 6.2'."
 
-    st.chat_message("assistant").write(answer)
+    if not already_rendered:
+        st.chat_message("assistant").write(answer)
     audio_file = speak_text(str(answer).replace("#", "").replace("*", ""))
     if audio_file:
         st.audio(audio_file)
