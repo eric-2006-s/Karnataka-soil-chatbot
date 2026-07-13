@@ -622,6 +622,20 @@ def add_boundary_layer(m, geojson_data, name_key, fill_color="#4caf50", border_c
                 }}
 
                 refreshStyle();
+
+                // Fix stray white/gray space inside the map box. Leaflet measures its
+                // container's pixel size at the instant it's constructed — if the Streamlit
+                // iframe hasn't finished its own layout pass yet (very common, since it's
+                // rendered inside a dynamically-sized component), Leaflet ends up loading tiles
+                // for a smaller area than what's actually visible, and leaves the rest blank
+                // until the user manually pans or zooms. invalidateSize() forces Leaflet to
+                // re-measure the container and fetch the missing tiles. We call it once shortly
+                // after load, once again a bit later as a safety net for slow-loading iframes,
+                // and on every window resize so it self-heals if the layout shifts again.
+                setTimeout(function() {{ mapObj.invalidateSize(); }}, 250);
+                setTimeout(function() {{ mapObj.invalidateSize(); }}, 800);
+                window.addEventListener('resize', function() {{ mapObj.invalidateSize(); }});
+
                 console.log('[boundary-satellite-toggle] initialized OK');
             }} catch (err) {{
                 // Defensive fallback only — under normal script ordering this branch is never
