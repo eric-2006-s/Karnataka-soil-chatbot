@@ -623,23 +623,12 @@ def add_boundary_layer(m, geojson_data, name_key, fill_color="#4caf50", border_c
 
                 refreshStyle();
 
-                // Fix stray white/gray space inside the map box. Leaflet measures its
-                // container's pixel size at the instant it's constructed — if the Streamlit
-                // iframe hasn't finished its own layout pass yet (very common, since it's
-                // rendered inside a dynamically-sized component), Leaflet ends up loading tiles
-                // for a smaller area than what's actually visible, and leaves the rest blank
-                // until the user manually pans or zooms. invalidateSize() forces Leaflet to
-                // re-measure the container and fetch the missing tiles. We call it once shortly
-                // after load, once again a bit later as a safety net for slow-loading iframes,
-                // and on every window resize so it self-heals if the layout shifts again.
                 setTimeout(function() {{ mapObj.invalidateSize(); }}, 250);
                 setTimeout(function() {{ mapObj.invalidateSize(); }}, 800);
                 window.addEventListener('resize', function() {{ mapObj.invalidateSize(); }});
 
                 console.log('[boundary-satellite-toggle] initialized OK');
             }} catch (err) {{
-                // Defensive fallback only — under normal script ordering this branch is never
-                // taken, since map_var/gj_var/tile-layer vars are already declared above us.
                 console.warn('[boundary-satellite-toggle] not ready yet, retrying:', err.message);
                 setTimeout(tryInit, 50);
             }}
@@ -721,6 +710,11 @@ section[data-testid="stSidebar"] span,section[data-testid="stSidebar"] label{col
 .stSuccess{background-color:#e8f5e9!important;border-left:4px solid #4caf50!important;border-radius:6px!important;}
 [data-testid="stMetricLabel"]{font-size:11px!important;color:#2e6b2e!important;}
 [data-testid="stMetricValue"]{font-size:18px!important;color:#1a3a1a!important;}
+/* st_folium known bug: the component's outer iframe sometimes measures itself
+   taller than the actual Leaflet map on first render, leaving blank space
+   below it. Pin the iframe to the exact height we pass to st_folium(height=520)
+   everywhere it's used, instead of letting the component auto-size. */
+iframe[title="streamlit_folium.st_folium"] { height: 520px !important; }
 </style>""", unsafe_allow_html=True)
 
 st.markdown("<h1>🌱 Karnataka Soil Chatbot</h1>", unsafe_allow_html=True)
@@ -837,11 +831,6 @@ elif search_mode == "Map (click to select)":
             m = folium.Map(tiles=None)
             m.fit_bounds(st.session_state.zoom_bounds)
 
-            # Capture the TileLayer objects themselves (not just their names) — needed so the
-            # baselayerchange listener in add_boundary_layer can check which is active.
-            # show=False on all but the default is required: Folium adds every TileLayer with
-            # show=True straight onto the map at load, so without this all three base layers end
-            # up stacked simultaneously and the layer control's exclusivity gets unreliable.
             satellite_tile = folium.TileLayer(
                 tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
                 attr="Esri World Imagery", name="🛰️ Satellite", overlay=False, control=True, show=True,
@@ -858,9 +847,6 @@ elif search_mode == "Map (click to select)":
                 (village_df["DISTRICT"].astype(str)==st.session_state.sel_district) &
                 (village_df["SUB_DIST"].astype(str)==st.session_state.sel_subdist)
             ]
-            # satellite_toggle_layers: fill + hover-highlight are hidden only while one of these
-            # tile layer objects is the active base layer; switching to "🗺️ Street map" via the
-            # layer control brings the fill and highlight back live, no rerun needed.
             if color_metric in CHOROPLETH_METRIC_COL_MAP:
                 pc = CHOROPLETH_METRIC_COL_MAP[color_metric]
                 cm_map, lm, (vmin,vmax) = compute_choropleth(subdist_villages,"KGISVill_2",pc)
