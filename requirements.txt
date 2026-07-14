@@ -1,6 +1,12 @@
 # ── Core app ─────────────────────────────────────────────────
 streamlit==1.59.1
 
+# ── Dataset download ─────────────────────────────────────────
+# Used instead of raw requests.get() to fetch Export_Output.csv from
+# HuggingFace — handles HF's Xet CDN backend correctly (raw requests.get()
+# on Xet-backed repos intermittently returns 403 on the signed redirect URL).
+huggingface_hub==0.26.2
+
 # ── Data ─────────────────────────────────────────────────────
 # pandas 2.2.x is the last well-established line before the 3.0 major bump —
 # geopandas/pyogrio are widely tested against it. pandas 3.0 is too new;
