@@ -1158,7 +1158,7 @@ if query:
                        f"Texture: {texture_soil_type(record.get('TEXTURE',0))}, pH: {record.get('PH','N/A')}\n"
                        f"Question: {query}. Be concise.")
             try:
-                res = groq_client.chat.completions.create(model="llama-3.1-8b-instant",
+                res = groq_client.chat.completions.create(model="openai/gpt-oss-20b",
                       messages=[{"role":"user","content":context}], max_tokens=500)
                 answer = res.choices[0].message.content
             except Exception as e:
