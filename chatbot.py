@@ -41,14 +41,53 @@ def load_village_data():
     df[float_cols] = df[float_cols].astype("float32")
     return df
 
+def _download_csv_from_hf():
+    """Downloads Export_Output.csv from the HuggingFace dataset repo.
+
+    Plain requests.get() on the /resolve/main/... URL gets redirected to a
+    signed HuggingFace 'Xet' CDN URL (xet-bridge-us...), and those signed
+    redirects intermittently return 403 Forbidden — a known reliability issue
+    with HF's newer Xet storage backend, not something specific to this repo
+    or this code. huggingface_hub's own downloader handles Xet negotiation,
+    retries, and resumable downloads correctly; we also explicitly disable
+    Xet (HF_HUB_DISABLE_XET=1), which falls back to the older, more reliable
+    plain-HTTP CDN path and is the community-documented fix for this 403.
+    """
+    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+    try:
+        from huggingface_hub import hf_hub_download
+        downloaded_path = hf_hub_download(
+            repo_id="ricu9656/karnataka-soil-data",
+            repo_type="dataset",
+            filename="Export_Output.csv",
+        )
+        import shutil
+        shutil.copy(downloaded_path, CSV_PATH)
+        return
+    except Exception:
+        pass  # fall through to the plain-requests fallback below
+
+    # Fallback: plain HTTP with a browser-like User-Agent (some CDN edges
+    # reject the default python-requests UA) and a couple of retries, in
+    # case huggingface_hub itself isn't available or also fails.
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; SoilMitraAI/1.0)"}
+    last_err = None
+    for attempt in range(3):
+        try:
+            r = requests.get(CSV_URL, headers=headers, timeout=60)
+            r.raise_for_status()
+            with open(CSV_PATH, "wb") as f:
+                f.write(r.content)
+            return
+        except Exception as e:
+            last_err = e
+    raise last_err
+
 @st.cache_data
 def load_csv_data():
     if not os.path.exists(CSV_PATH):
         with st.spinner("Downloading soil dataset (first run only)..."):
-            r = requests.get(CSV_URL)
-            r.raise_for_status()
-            with open(CSV_PATH, "wb") as f:
-                f.write(r.content)
+            _download_csv_from_hf()
     df = pd.read_csv(CSV_PATH)
     df = df.rename(columns={"Depth": "DEPTH", "pH": "PH", "Texture": "TEXTURE", "Longitude": "longitude"})
     df = df[df['latitude'].notna() & df['longitude'].notna()]
