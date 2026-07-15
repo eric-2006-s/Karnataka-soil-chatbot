@@ -712,7 +712,7 @@ def render_choropleth_legend(param_col, label, label_map, vmin, vmax, group_word
 
 def init_map_state():
     for k,v in {"map_level":"district","sel_district":None,"sel_subdist":None,
-                "sel_village":None,"zoom_bounds":None}.items():
+                "sel_village":None,"zoom_bounds":None,"picked_lat":None,"picked_lon":None}.items():
         if k not in st.session_state: st.session_state[k] = v
 
 def set_current_scope(district=None, subdist=None):
@@ -721,9 +721,13 @@ def set_current_scope(district=None, subdist=None):
 
 def reset_map_selection():
     for k,v in {"map_level":"district","sel_district":None,"sel_subdist":None,
-                "sel_village":None,"zoom_bounds":None}.items():
+                "sel_village":None,"zoom_bounds":None,"picked_lat":None,"picked_lon":None}.items():
         st.session_state[k] = v
     set_current_scope(None,None)
+
+def clear_picked_point():
+    st.session_state["picked_lat"] = None
+    st.session_state["picked_lon"] = None
 
 # ══════════════════════════════════════════════════════════════
 # UI
@@ -766,6 +770,8 @@ search_mode = st.radio("Search by", [
 ])
 
 record = None; nearest_village = None; input_lat = input_lon = None; location_label = "Selected location"
+using_picked_point = False  # True when a precise in-village point (Map mode) is active, so the
+                             # generic metrics section reuses the same display path as Lat/Lon mode
 
 # ── Mode 1: Dropdown ─────────────────────────────────────────
 if search_mode == "District / Sub-district / Village (dropdown)":
@@ -788,10 +794,12 @@ elif search_mode == "Map (click to select)":
     b1,b2,b3,_ = st.columns([1,1,1,3])
     if b1.button("⟲ Reset", key="btn_reset_map"): reset_map_selection(); st.rerun()
     if st.session_state.sel_district and b2.button(f"◀ {st.session_state.sel_district}", key="btn_back_d"):
-        st.session_state.update({"map_level":"district","sel_district":None,"sel_subdist":None,"sel_village":None,"zoom_bounds":None})
+        st.session_state.update({"map_level":"district","sel_district":None,"sel_subdist":None,"sel_village":None,
+                                 "zoom_bounds":None,"picked_lat":None,"picked_lon":None})
         set_current_scope(None,None); st.rerun()
     if st.session_state.sel_subdist and b3.button(f"◀ {st.session_state.sel_subdist}", key="btn_back_s"):
-        st.session_state.update({"map_level":"subdistrict","sel_subdist":None,"sel_village":None})
+        st.session_state.update({"map_level":"subdistrict","sel_subdist":None,"sel_village":None,
+                                 "picked_lat":None,"picked_lon":None})
         set_current_scope(st.session_state.sel_district,None); st.rerun()
 
     # Level 1 — Districts
@@ -907,7 +915,10 @@ elif search_mode == "Map (click to select)":
             if clicked:
                 name = clicked["properties"]["KGISVill_2"].strip()
                 if name and name != st.session_state.sel_village:
-                    st.session_state.sel_village = name; st.rerun()
+                    st.session_state.sel_village = name
+                    st.session_state.picked_lat = None
+                    st.session_state.picked_lon = None
+                    st.rerun()
 
     if st.session_state.sel_village:
         matches = village_df[
@@ -920,6 +931,54 @@ elif search_mode == "Map (click to select)":
         else:
             record = matches.iloc[0]; location_label = str(record["KGISVill_2"])
             st.success(f"📍 Selected: **{location_label}** ({st.session_state.sel_subdist}, {st.session_state.sel_district})")
+
+            # ── Pick an exact point inside the selected village ──────
+            pick_mode = st.checkbox(
+                "📍 Click the map above to pick an exact point inside this village "
+                "(instead of using the village-wide average)",
+                key="pick_point_mode",
+            )
+            if pick_mode:
+                last_clicked = map_data.get("last_clicked")  # {'lat':.., 'lng':..} raw map click,
+                                                                # distinct from the polygon-select click above
+                if last_clicked:
+                    new_lat, new_lon = last_clicked["lat"], last_clicked["lng"]
+                    if (new_lat, new_lon) != (st.session_state.picked_lat, st.session_state.picked_lon):
+                        st.session_state.picked_lat = new_lat
+                        st.session_state.picked_lon = new_lon
+                        st.rerun()
+
+            if st.session_state.picked_lat is not None:
+                point_record = idw_estimate(
+                    csv_tree, csv_df, st.session_state.picked_lat, st.session_state.picked_lon,
+                    columns=["SOC","DEPTH","TEXTURE","PH"], k=4,
+                )
+                pcol1, pcol2 = st.columns([5,1])
+                pcol1.markdown(
+                    f"**📍 Precise point:** {st.session_state.picked_lat:.6f}, {st.session_state.picked_lon:.6f} "
+                    f"— IDW-estimated from the 4 nearest known sample points."
+                )
+                if pcol2.button("✕ Clear point", key="btn_clear_point"):
+                    clear_picked_point(); st.rerun()
+                if point_record is None:
+                    st.warning("No soil sample data near that exact point (outside coverage area). Try clicking closer to the village center.")
+                    # point_record is None — keep the village-average `record` from above as-is,
+                    # don't touch input_lat/using_picked_point, so the generic metrics section
+                    # below falls back to displaying the whole-village reading instead.
+                else:
+                    # point_record only has SOC/DEPTH/TEXTURE/PH — it does NOT have KGISVill_2,
+                    # DISTRICT, latitude, longitude etc. Rather than overriding `record` directly
+                    # (which crashes the generic metrics section further down, since that section
+                    # assumes those extra fields unless search_mode == "Latitude & Longitude"),
+                    # route through the exact same input_lat/input_lon/nearest_village path that
+                    # mode already uses successfully — the display code lower down already knows
+                    # how to render an IDW point reading + a "nearest village for reference" panel.
+                    record = point_record
+                    input_lat, input_lon = st.session_state.picked_lat, st.session_state.picked_lon
+                    nearest_village = matches.iloc[0]
+                    using_picked_point = True
+                    location_label = (f"{input_lat:.4f}, {input_lon:.4f} "
+                                      f"(inside {matches.iloc[0]['KGISVill_2']})")
     else:
         record = None
         st.info("Click a district, then a sub-district, then a village.")
@@ -972,7 +1031,7 @@ st.markdown("---")
 if record is None:
     st.info("Select a valid location, or ask a dataset-wide question in the chat below.")
 
-if search_mode == "Latitude & Longitude" and record is not None:
+if (search_mode == "Latitude & Longitude" or using_picked_point) and record is not None:
     st.markdown("#### 📊 IDW-estimated soil data at entered coordinates")
     st.caption("Estimated from the 4 nearest known sample points, weighted by distance.")
     c1,c2,c3,c4,c5 = st.columns(5)
@@ -1006,8 +1065,8 @@ elif record is not None:
 if record is not None:
     st.markdown("---")
     st.markdown("#### 🌦️ Weather Forecast")
-    weather_lat = input_lat if search_mode=="Latitude & Longitude" else float(record["latitude"])
-    weather_lon = input_lon if search_mode=="Latitude & Longitude" else float(record["longitude"])
+    weather_lat = input_lat if (search_mode=="Latitude & Longitude" or using_picked_point) else float(record["latitude"])
+    weather_lon = input_lon if (search_mode=="Latitude & Longitude" or using_picked_point) else float(record["longitude"])
     wd = fetch_weather(weather_lat, weather_lon)
     if wd:
         cur = wd.get("current",{}); daily = wd.get("daily",{})
