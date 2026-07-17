@@ -732,7 +732,7 @@ def clear_picked_point():
 # ══════════════════════════════════════════════════════════════
 # UI
 # ══════════════════════════════════════════════════════════════
-st.set_page_config(page_title="Karnataka Soil Chatbot", page_icon="🌱", layout="wide")
+st.set_page_config(page_title="SoilMitra AI – South Indian Soil Intelligence and Advisory System", page_icon="🌱", layout="wide")
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
@@ -760,7 +760,7 @@ section[data-testid="stSidebar"] span,section[data-testid="stSidebar"] label{col
 iframe[title="streamlit_folium.st_folium"] { height: 520px !important; }
 </style>""", unsafe_allow_html=True)
 
-st.markdown("<h1>🌱 Karnataka Soil Chatbot</h1>", unsafe_allow_html=True)
+st.markdown("<h1>🌱SoilMitra AI – South Indian Soil Intelligence and Advisory System</h1>", unsafe_allow_html=True)
 
 search_mode = st.radio("Search by", [
     "District / Sub-district / Village (dropdown)",
