@@ -772,6 +772,10 @@ search_mode = st.radio("Search by", [
 record = None; nearest_village = None; input_lat = input_lon = None; location_label = "Selected location"
 using_picked_point = False  # True when a precise in-village point (Map mode) is active, so the
                              # generic metrics section reuses the same display path as Lat/Lon mode
+nearest_csv_point = None    # Nearest SINGLE raw sample row from Export_Output.csv (k=1 on csv_tree),
+                             # as opposed to nearest_village (nearest row in the averaged village
+                             # dataset). Set in Lat/Lon mode and in Map mode's point-picking flow.
+csv_dist_km = None
 
 # ── Mode 1: Dropdown ─────────────────────────────────────────
 if search_mode == "District / Sub-district / Village (dropdown)":
@@ -966,6 +970,16 @@ elif search_mode == "Map (click to select)":
                     # don't touch input_lat/using_picked_point, so the generic metrics section
                     # below falls back to displaying the whole-village reading instead.
                 else:
+                    # Nearest SINGLE raw sample point from the CSV, same idea as Lat/Lon mode —
+                    # the one real reading closest to the clicked point, not the IDW blend.
+                    _, csv_idx = csv_tree.query(
+                        [[st.session_state.picked_lat, st.session_state.picked_lon]], k=1
+                    )
+                    nearest_csv_point = csv_df.iloc[csv_idx[0]]
+                    csv_dist_km = haversine_km(
+                        st.session_state.picked_lat, st.session_state.picked_lon,
+                        float(nearest_csv_point["latitude"]), float(nearest_csv_point["longitude"])
+                    )
                     # point_record only has SOC/DEPTH/TEXTURE/PH — it does NOT have KGISVill_2,
                     # DISTRICT, latitude, longitude etc. Rather than overriding `record` directly
                     # (which crashes the generic metrics section further down, since that section
@@ -995,6 +1009,16 @@ elif search_mode == "Latitude & Longitude":
         _, vill_idx = village_tree.query([[input_lat, input_lon]], k=1)
         nearest_village = village_df.iloc[vill_idx[0]]
         dist_km = haversine_km(input_lat, input_lon, float(nearest_village["latitude"]), float(nearest_village["longitude"]))
+
+        # Nearest SINGLE raw sample point from the CSV (Export_Output.csv), as opposed to
+        # nearest_village above (which comes from the averaged village-level dataset).
+        # This is the actual raw sample record IDW's 4-neighbor average is centered around —
+        # useful to show the single closest real reading, not just the interpolated blend.
+        _, csv_idx = csv_tree.query([[input_lat, input_lon]], k=1)
+        nearest_csv_point = csv_df.iloc[csv_idx[0]]
+        csv_dist_km = haversine_km(input_lat, input_lon,
+                                    float(nearest_csv_point["latitude"]), float(nearest_csv_point["longitude"]))
+
         st.markdown("---")
         st.success(f"📍 Nearest village: **{nearest_village['KGISVill_2']}** ({nearest_village['SUB_DIST']}, {nearest_village['DISTRICT']}) — {dist_km:.1f} km away")
         record = csv_record
@@ -1048,7 +1072,24 @@ if (search_mode == "Latitude & Longitude" or using_picked_point) and record is n
     v4.metric("Depth (cm)", int(nearest_village["DEPTH"]))
     v5.metric("Texture",    texture_soil_type(nearest_village['TEXTURE']))
     v6.metric("pH",         f"{float(nearest_village['PH']):.2f}")
-    st.map(pd.DataFrame({"lat":[input_lat,float(nearest_village["latitude"])],"lon":[input_lon,float(nearest_village["longitude"])]}))
+
+    # ── Nearest single raw CSV sample point (the actual closest real reading, not the
+    # averaged village and not the IDW blend — this is what IDW's k=4 neighborhood is built from) ──
+    if nearest_csv_point is not None:
+        st.markdown("#### 📌 Nearest raw sample point (Export_Output.csv)")
+        st.caption(f"The single closest real sample reading — {csv_dist_km:.2f} km from the query point.")
+        p1,p2,p3,p4,p5 = st.columns(5)
+        p1.metric("Distance",   f"{csv_dist_km:.2f} km")
+        p2.metric("SOC (%)",    f"{float(nearest_csv_point['SOC']):.2f}")
+        p3.metric("Depth (cm)", round(float(nearest_csv_point['DEPTH'])))
+        p4.metric("Texture",    texture_soil_type(nearest_csv_point['TEXTURE']))
+        p5.metric("pH",         f"{float(nearest_csv_point['PH']):.2f}")
+
+    map_points = {"lat":[input_lat,float(nearest_village["latitude"])],"lon":[input_lon,float(nearest_village["longitude"])]}
+    if nearest_csv_point is not None:
+        map_points["lat"].append(float(nearest_csv_point["latitude"]))
+        map_points["lon"].append(float(nearest_csv_point["longitude"]))
+    st.map(pd.DataFrame(map_points))
 elif record is not None:
     c1,c2,c3,c4,c5,c6 = st.columns(6)
     c1.metric("Village",    record["KGISVill_2"])
