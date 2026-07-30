@@ -1,5 +1,4 @@
 name: Keep Streamlit App Awake
-
 on:
   schedule:
     - cron: '0 */6 * * *'
@@ -9,7 +8,44 @@ jobs:
   ping:
     runs-on: ubuntu-latest
     steps:
-      - name: Ping the app to reset its inactivity clock
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Playwright
         run: |
-          curl -sSf --max-time 30 "${{ vars.STREAMLIT_APP_URL }}" -o /dev/null
-          echo "Pinged ${{ vars.STREAMLIT_APP_URL }} — status OK"
+          pip install playwright
+          playwright install --with-deps chromium
+
+      - name: Load the app in a real browser session
+        run: |
+          python - <<'EOF'
+          from playwright.sync_api import sync_playwright
+          import os, sys, time
+
+          url = os.environ["STREAMLIT_APP_URL"]
+
+          with sync_playwright() as p:
+              browser = p.chromium.launch()
+              page = browser.new_page()
+              page.goto(url, timeout=60000, wait_until="networkidle")
+              # Streamlit needs a few seconds after load to open its websocket
+              # and register the session as "active"
+              time.sleep(8)
+
+              # If Streamlit Cloud shows the "app is sleeping, click to wake" screen,
+              # click the wake button
+              try:
+                  wake_btn = page.get_by_text("Yes, get this app back up!", exact=False)
+                  if wake_btn.count() > 0:
+                      wake_btn.first.click()
+                      time.sleep(15)
+              except Exception:
+                  pass
+
+              print(f"Loaded {url} — title: {page.title()}")
+              browser.close()
+          EOF
+        env:
+          STREAMLIT_APP_URL: ${{ vars.STREAMLIT_APP_URL }}
