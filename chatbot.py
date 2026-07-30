@@ -699,6 +699,7 @@ def compute_choropleth(df_source, group_col, param_col):
             {n:f"{v:.2f}" for n,v in avg.items()}, (vmin,vmax))
 
 def render_choropleth_legend(param_col, label, label_map, vmin, vmax, group_word):
+    """Sidebar/inline text caption version of the legend (kept for quick scanning above the map)."""
     if param_col=="TEXTURE":
         if not label_map: return
         types_present = sorted(set(label_map.values()),
@@ -709,6 +710,58 @@ def render_choropleth_legend(param_col, label, label_map, vmin, vmax, group_word
         st.markdown(f"🎨 Dominant soil type per {group_word}: {swatches}", unsafe_allow_html=True)
     elif vmin is not None:
         st.caption(f"🎨 Colour scale (green→red): {vmin:.2f} → {vmax:.2f} average {label} per {group_word}")
+
+def add_map_legend(m, param_col, label, label_map, vmin, vmax):
+    """
+    Adds a REAL legend control rendered directly on the folium/Leaflet map (bottom-left corner),
+    as opposed to render_choropleth_legend() above which only prints a text caption in the
+    Streamlit page above the map. Call this ONLY when a metric (not 'Default (by name)') is
+    selected, i.e. right after compute_choropleth() returns a non-empty cm_map.
+
+    - Numeric params (SOC/pH/Depth): a smooth green→yellow→red gradient bar via branca,
+      matching the RdYlGn_r colormap used in compute_choropleth().
+    - TEXTURE: a discrete swatch box, one row per soil type actually present on this map.
+
+    Must be called BEFORE st_folium(m, ...) — the legend has to be added to `m` first.
+    """
+    import folium
+    import branca.colormap as bcm
+
+    if param_col == "TEXTURE":
+        if not label_map:
+            return
+        present_types = sorted(
+            set(label_map.values()),
+            key=lambda t: [b[1] for b in TEXTURE_BANDS].index(t) if t in [b[1] for b in TEXTURE_BANDS] else 99
+        )
+        rows = "".join(
+            f'<div style="display:flex;align-items:center;margin:2px 0;">'
+            f'<span style="width:14px;height:14px;background:{TEXTURE_TYPE_COLORS.get(t,"#ccc")};'
+            f'border-radius:2px;margin-right:6px;border:1px solid #333;flex-shrink:0;"></span>'
+            f'<span style="font-size:12px;color:#1a3a1a;">{t}</span></div>'
+            for t in present_types
+        )
+        html = f"""
+        <div style="position:fixed;bottom:30px;left:10px;z-index:9999;
+                    background:white;padding:8px 10px;border-radius:6px;
+                    border:1px solid #a5d6a7;box-shadow:0 1px 4px rgba(0,0,0,0.3);
+                    max-height:220px;overflow-y:auto;">
+            <div style="font-size:12px;font-weight:600;margin-bottom:4px;color:#1a4d1a;">Dominant soil type</div>
+            {rows}
+        </div>"""
+        m.get_root().html.add_child(folium.Element(html))
+    else:
+        if vmin is None or vmax is None:
+            return
+        if vmin == vmax:
+            vmax = vmin + 1  # branca needs a non-zero range
+        # Colors match the "RdYlGn_r" cmap used in compute_choropleth (low=green, high=red)
+        colormap = bcm.LinearColormap(
+            colors=["#1a9850", "#ffffbf", "#d73027"],
+            vmin=vmin, vmax=vmax,
+            caption=f"{label} (avg per {label_map and 'area' or 'area'})" if False else f"{label} (avg)",
+        )
+        colormap.add_to(m)
 
 def init_map_state():
     for k,v in {"map_level":"district","sel_district":None,"sel_subdist":None,
@@ -818,6 +871,7 @@ elif search_mode == "Map (click to select)":
             cm_map, lm, (vmin,vmax) = compute_choropleth(village_df,"DISTRICT",pc)
             add_boundary_layer(m, gdf_to_geojson(district_gdf), "DISTRICT", value_color_map=cm_map, value_labels=lm,
                                border_only=border_only_d)
+            add_map_legend(m, pc, color_metric.split()[0], lm, vmin, vmax)
             render_choropleth_legend(pc, color_metric.split()[0], lm, vmin, vmax, "district")
         else:
             add_boundary_layer(m, gdf_to_geojson(district_gdf), "DISTRICT", color_by_feature=True,
@@ -849,6 +903,7 @@ elif search_mode == "Map (click to select)":
                 cm_map, lm, (vmin,vmax) = compute_choropleth(dist_villages,"SUB_DIST",pc)
                 add_boundary_layer(m, gdf_to_geojson(taluk_gdf), "SUB_DIST", value_color_map=cm_map, value_labels=lm,
                                    border_only=border_only_s)
+                add_map_legend(m, pc, color_metric.split()[0], lm, vmin, vmax)
                 render_choropleth_legend(pc, color_metric.split()[0], lm, vmin, vmax, "sub-district")
             else:
                 add_boundary_layer(m, gdf_to_geojson(taluk_gdf), "SUB_DIST", fill_color="#4caf50", border_color="#1a4d1a",
@@ -905,6 +960,7 @@ elif search_mode == "Map (click to select)":
                                    value_color_map=cm_map, value_labels=lm,
                                    satellite_toggle_layers=[satellite_tile, google_tile],
                                    border_only=border_only_v)
+                add_map_legend(m, pc, color_metric.split()[0], lm, vmin, vmax)
                 render_choropleth_legend(pc, color_metric.split()[0], lm, vmin, vmax, "village")
             else:
                 add_boundary_layer(m, gdf_to_geojson(vill_gdf), "KGISVill_2",
