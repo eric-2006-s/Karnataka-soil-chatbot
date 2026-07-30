@@ -1317,6 +1317,7 @@ if query:
                 res = groq_client.chat.completions.create(model="openai/gpt-oss-20b",
                       messages=[{"role":"user","content":context}], max_tokens=500)
                 answer = res.choices[0].message.content
+                answer += "\n\n_⚠️ This response is AI-generated. Please consult a certified agronomist or soil expert before acting on it._"
             except Exception as e:
                 answer = f"AI unavailable: {e}"
     else:
